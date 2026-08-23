@@ -1,0 +1,54 @@
+{
+    "name": "kinetis/storage",
+    "description": "File storage for Kinetis, built on League\\Flysystem — local storage via a genuinely non-blocking Amp\\File-backed adapter; remote backends (S3, etc.) live in kinetis/storage-s3.",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Alon Noy"
+        }
+    ],
+    "require": {
+        "php": "^8.4",
+        "kinetis/framework": "dev-main",
+        "league/flysystem": "^3.35.2",
+        "league/mime-type-detection": "^1.17.0",
+        "amphp/file": "^3.2.0",
+        "amphp/byte-stream": "^2.1.2"
+    },
+    "require-dev": {
+        "infection/infection": "^0.35.0",
+        "phpstan/phpstan": "^2.2.8",
+        "phpunit/phpunit": "^12.5.33",
+        "vimeo/psalm": "^6.16.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Kinetis\\Storage\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Kinetis\\Storage\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "kinetis": {
+            "bootstrap": "Kinetis\\Storage\\PackageBootstrap"
+        }
+    },
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../framework"
+        }
+    ],
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "infection/extension-installer": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
