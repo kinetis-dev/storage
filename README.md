@@ -18,13 +18,17 @@
 
 ---
 
+Part of [Kinetis](https://kinetis.dev/), a non-blocking PHP framework for
+API-first applications, developed in the
+[kinetis-dev/kinetis](https://github.com/kinetis-dev/kinetis) monorepo.
+
 Read, write, delete, and list files against `League\Flysystem`'s
 `FilesystemOperator` interface — swappable to a different backend with no
 application-code changes. Local storage is Kinetis's own backend,
 `Amp\File`-backed rather than Flysystem's own local adapter, so every
 operation genuinely suspends the calling Fiber instead of blocking the
 whole worker process. Remote backends (S3, etc.) live in the separate
-`kinetis/storage-s3`.
+[`kinetis/storage-s3`](https://github.com/kinetis-dev/storage-s3).
 
 ```php
 use Kinetis\Storage\FilesystemFactory;
@@ -54,7 +58,7 @@ is scoped.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `FILESYSTEM_DRIVER` | `local` | `local`, or `s3` (needs `kinetis/storage-s3`). |
+| `FILESYSTEM_DRIVER` | `local` | `local`, or `s3` (needs [`kinetis/storage-s3`](https://github.com/kinetis-dev/storage-s3)). |
 | `FILESYSTEM_ROOT` | *(required for local)* | Local disk root path. |
 
 Scoped keys follow the named-connection convention — the connection
@@ -68,7 +72,7 @@ Full reference across every package:
 composer require kinetis/storage
 ```
 
-Requires PHP 8.4+ and `kinetis/framework`. Full documentation:
+Requires PHP 8.4+ and [`kinetis/framework`](https://github.com/kinetis-dev/framework). Full documentation:
 [kinetis.dev/docs/storage.html](https://kinetis.dev/docs/storage.html).
 
 ## License

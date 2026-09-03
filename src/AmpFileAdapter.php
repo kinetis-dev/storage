@@ -116,11 +116,30 @@ use function Amp\ByteStream\pipe;
  *   restricting symlink() for every other writer via seccomp/an LSM
  *   profile.
  *
+ * copy()'s retained-visibility resolution carries the identical
+ * check-then-use structure, for the identical reason — see
+ * verifiedSourceStatus()'s own docblock for what it actually verifies
+ * and doesn't.
+ *
  * See {doc}`storage`.
  */
 final readonly class AmpFileAdapter implements FilesystemAdapter
 {
     private const int MIME_TYPE_SAMPLE_BYTES = 4096;
+
+    /**
+     * The POSIX S_IFMT mask, isolating a stat mode's file-type bits
+     * (regular file/directory/symlink/etc.) from its permission bits —
+     * a stable, portable value across every real Unix stat(2)
+     * implementation, not something specific to this project. Confirmed
+     * directly against real Amp\File\Filesystem::getStatus() output
+     * before relying on it, not assumed from the constant's own name: a
+     * plain file reports mode 0100644, a directory 0040755, a followed
+     * symlink the mode of whatever it points to (getStatus() follows
+     * symlinks; getLinkStatus() is the lstat()-equivalent that doesn't).
+     * Used by sourceModeUnchanged() below.
+     */
+    private const int TYPE_MASK = 0170000;
 
     private PathPrefixer $prefixer;
 
@@ -171,14 +190,53 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         $location = $this->prefixer->prefixPath($path);
         $this->assertNoSymlinkBelowRoot($location);
 
+        // Resolved — and, for a garbage value, thrown — before anything
+        // on disk is touched. See resolveExplicitFileMode()'s own
+        // docblock.
+        $mode = $this->resolveExplicitFileMode($config);
+        $existedBefore = true;
+        $modeFailed = false;
+
         try {
+            // isFile() delegates to getStatus(), which can itself throw
+            // FilesystemException — kept inside this try, not before
+            // it, so that failure surfaces as UnableToWriteFile too,
+            // not raw.
+            if ($mode !== null) {
+                $existedBefore = $this->filesystem->isFile($location);
+            }
+
             $this->ensureParentDirectoryExists($location, $config);
-            $this->filesystem->write($location, $contents);
-        } catch (FilesystemException $e) {
+            $handle = $this->filesystem->openFile($location, 'w');
+
+            try {
+                // Applied before the body is written, not after — see
+                // resolveExplicitFileMode()'s own docblock for why this
+                // ordering closes the confidentiality gap a
+                // mode-after-body sequence would leave open.
+                if ($mode !== null) {
+                    try {
+                        $this->filesystem->changePermissions($location, $mode);
+                    } catch (FilesystemException $e) {
+                        $modeFailed = true;
+
+                        throw $e;
+                    }
+                }
+
+                $handle->write($contents);
+            } finally {
+                $handle->close();
+            }
+        } catch (FilesystemException|StreamException $e) {
+            // Deferred until $handle is guaranteed closed by the
+            // finally above: unlinking an open file works on POSIX but
+            // is not portable — Windows commonly refuses to unlink a
+            // file with an open handle.
+            $this->deleteIfNewAfterModeFailure($location, $modeFailed, $existedBefore);
+
             throw UnableToWriteFile::atLocation($path, $e->getMessage(), $e);
         }
-
-        $this->applyFileVisibility($location, $config);
     }
 
     #[\Override]
@@ -187,20 +245,59 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         $location = $this->prefixer->prefixPath($path);
         $this->assertNoSymlinkBelowRoot($location);
 
+        $mode = $this->resolveExplicitFileMode($config);
+        $existedBefore = true;
+        $modeFailed = false;
+
         try {
+            if ($mode !== null) {
+                $existedBefore = $this->filesystem->isFile($location);
+            }
+
             $this->ensureParentDirectoryExists($location, $config);
             $handle = $this->filesystem->openFile($location, 'w');
 
             try {
+                if ($mode !== null) {
+                    try {
+                        $this->filesystem->changePermissions($location, $mode);
+                    } catch (FilesystemException $e) {
+                        $modeFailed = true;
+
+                        throw $e;
+                    }
+                }
+
                 pipe(new ReadableResourceStream($contents), $handle);
             } finally {
                 $handle->close();
             }
         } catch (FilesystemException|StreamException $e) {
+            $this->deleteIfNewAfterModeFailure($location, $modeFailed, $existedBefore);
+
             throw UnableToWriteFile::atLocation($path, $e->getMessage(), $e);
         }
+    }
 
-        $this->applyFileVisibility($location, $config);
+    /**
+     * Resolves the concrete file mode an explicit visibility maps to —
+     * before openFile('w') below ever touches $location, not after.
+     * VisibilityConverter::forFile() is a pure, side-effect-free
+     * string-to-int mapping, so calling it here means a garbage
+     * explicit value's InvalidVisibilityProvided escapes before
+     * openFile('w') truncates whatever content $location might already
+     * hold, rather than after — the smallest possible blast radius for
+     * an invalid request: zero disk mutation at all, not merely "no
+     * secret bytes written." Returns null when no visibility was
+     * requested, so write()/writeStream() skip applying a mode
+     * entirely — pure overhead on the overwhelming majority of writes
+     * that never set one.
+     */
+    private function resolveExplicitFileMode(Config $config): ?int
+    {
+        $visibility = $config->get(Config::OPTION_VISIBILITY);
+
+        return $visibility !== null ? $this->visibility->forFile((string) $visibility) : null;
     }
 
     #[\Override]
@@ -221,12 +318,93 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     {
         $contents = $this->read($path);
 
-        /** @var resource $stream */
-        $stream = fopen('php://temp', 'r+b');
-        fwrite($stream, $contents);
-        rewind($stream);
+        \error_clear_last();
+        $stream = @\fopen('php://temp', 'r+b');
+
+        if ($stream === false) {
+            throw UnableToReadFile::fromLocation($path, $this->describeLastWarning('unable to open a temporary stream'));
+        }
+
+        try {
+            $this->populateTempStream($stream, $path, $contents);
+        } catch (UnableToReadFile $e) {
+            \fclose($stream);
+
+            throw $e;
+        }
 
         return $stream;
+    }
+
+    /**
+     * Writes $contents to $stream in a progress-checked loop, then
+     * rewinds it to byte zero — construction/population/rewind of the
+     * temporary stream readStream() hands back are all treated as part
+     * of the read operation, so a failure at any of these stages
+     * surfaces as UnableToReadFile for $path, never a bare PHP warning
+     * as the only signal (every native call here is @-suppressed, with
+     * the real warning text captured via describeLastWarning() instead
+     * of discarded).
+     *
+     * fwrite() is not guaranteed to consume its entire argument in one
+     * call — PHP's own streams layer retries a short stream_write()
+     * automatically, but only up to the first zero-progress attempt;
+     * confirmed directly, not assumed, since a userspace stream wrapper
+     * can force exactly that combination deterministically. A single
+     * unchecked fwrite() can therefore silently truncate $contents at
+     * whatever a caller's resource happened to accept in one attempt.
+     * false or zero progress on any individual call here is treated as
+     * a hard failure; a lesser positive count just continues the loop.
+     *
+     * $stream is left open at whatever position a failure occurred —
+     * this method only ever throws, never closes it; readStream() is
+     * the one responsible for closing it, since only readStream() knows
+     * whether $stream is one it opened itself versus one a caller
+     * handed in some other way.
+     *
+     * A resource parameter rather than the URL to open, deliberately:
+     * this is the seam a test uses to force a deterministic fwrite()/
+     * rewind() failure via a real, custom stream wrapper, without
+     * needing to exhaust a real resource (memory, disk, file
+     * descriptors) to trigger one.
+     *
+     * @param resource $stream
+     */
+    private function populateTempStream($stream, string $path, string $contents): void
+    {
+        $length = \strlen($contents);
+        $written = 0;
+
+        while ($written < $length) {
+            \error_clear_last();
+            $result = @\fwrite($stream, \substr($contents, $written));
+
+            if ($result === false || $result === 0) {
+                throw UnableToReadFile::fromLocation($path, $this->describeLastWarning('unable to write to the temporary stream'));
+            }
+
+            $written += $result;
+        }
+
+        \error_clear_last();
+
+        if (@\rewind($stream) === false) {
+            throw UnableToReadFile::fromLocation($path, $this->describeLastWarning('unable to rewind the temporary stream'));
+        }
+    }
+
+    /**
+     * The real PHP warning message for the @-suppressed call
+     * immediately before this, when one fired — genuinely more useful
+     * than a fixed string for whoever debugs a real failure — or
+     * $fallback when none did (a controlled test double, for instance,
+     * can fail without ever triggering a native warning at all).
+     */
+    private function describeLastWarning(string $fallback): string
+    {
+        $error = \error_get_last();
+
+        return $error !== null ? $error['message'] : $fallback;
     }
 
     #[\Override]
@@ -289,6 +467,16 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         }
     }
 
+    /**
+     * File-only by contract, not merely by this class's own choice —
+     * League\Flysystem\FilesystemAdapter::visibility() is declared to
+     * return FileAttributes specifically, never DirectoryAttributes, and
+     * League\Flysystem\Local\LocalFilesystemAdapter (Flysystem's own
+     * reference local adapter) implements this identically: always
+     * inverseForFile(), unconditionally, with no directory branch at
+     * all. Nothing upstream ever calls this with a directory path
+     * expecting directory-visibility semantics back.
+     */
     #[\Override]
     public function visibility(string $path): FileAttributes
     {
@@ -310,14 +498,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         $this->assertNoSymlinkBelowRoot($location);
 
         try {
-            $handle = $this->filesystem->openFile($location, 'r');
-
-            try {
-                $sample = $handle->read(length: self::MIME_TYPE_SAMPLE_BYTES) ?? '';
-            } finally {
-                $handle->close();
-            }
-        } catch (FilesystemException $e) {
+            $sample = $this->readMimeTypeSample($location);
+        } catch (FilesystemException|StreamException $e) {
             throw UnableToRetrieveMetadata::mimeType($path, $e->getMessage(), $e);
         }
 
@@ -328,6 +510,54 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         }
 
         return new FileAttributes($path, mimeType: $mimeType);
+    }
+
+    /**
+     * Reads up to MIME_TYPE_SAMPLE_BYTES from $location for mimeType()'s
+     * own detection. File::read() is a ReadableStream operation — the
+     * concrete driver actually in play here (ParallelFile, confirmed
+     * directly against its own source) only ever raises
+     * Amp\ByteStream\StreamException (or its ClosedException subtype)
+     * from read() itself, never Amp\File\FilesystemException, so only
+     * StreamException is caught around it; mimeType()'s own catch still
+     * lists both, since close() below genuinely can raise either.
+     *
+     * A close() failure while a read failure is already propagating is
+     * absorbed here rather than allowed to take its place: PHP does
+     * not discard an exception a try was already propagating when its
+     * own finally throws a different one — it makes the finally's
+     * exception the new outer exception and chains the original one
+     * beneath it as previous. Left unhandled, that means the catch
+     * below would see the close failure directly, with the real read
+     * failure only reachable one level deeper via
+     * getPrevious()->getPrevious() — not what
+     * UnableToRetrieveMetadata::mimeType()'s own reason/previous should
+     * report. Absorbing the close failure here keeps the read failure
+     * as the one mimeType() directly reports. A close() failure with no
+     * read failure in flight is not absorbed — it propagates normally,
+     * the same "closing is part of the operation" precedent
+     * write()/writeStream() already establish for their own handles.
+     */
+    private function readMimeTypeSample(string $location): string
+    {
+        $handle = $this->filesystem->openFile($location, 'r');
+        $primaryFailure = null;
+
+        try {
+            return $handle->read(length: self::MIME_TYPE_SAMPLE_BYTES) ?? '';
+        } catch (StreamException $e) {
+            $primaryFailure = $e;
+
+            throw $e;
+        } finally {
+            try {
+                $handle->close();
+            } catch (FilesystemException|StreamException $closeFailure) {
+                if ($primaryFailure === null) {
+                    throw $closeFailure;
+                }
+            }
+        }
     }
 
     #[\Override]
@@ -387,6 +617,42 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         } catch (FilesystemException $e) {
             throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
         }
+
+        // move() renames the same inode, so the destination already
+        // carries the source's own mode with nothing to do by default —
+        // only an explicit override needs applying. Kept a distinct
+        // catch, rather than folding into the block above, so a failure
+        // here still surfaces as UnableToMoveFile (the relocation itself
+        // already succeeded; only the requested permission change didn't).
+        // Deliberately never deletes $to on that failure, unlike copy()'s
+        // own equivalent catch block below: $to is the *only* remaining
+        // copy of the data after a successful rename — the source is
+        // gone — so removing it here would trade a wrong-mode file for
+        // real data loss, a strictly worse outcome. copy() has no such
+        // constraint: its source is untouched, so cleaning up its
+        // destination just means the copy didn't happen, not that
+        // anything was lost.
+        $explicitVisibility = $config->get(Config::OPTION_VISIBILITY);
+
+        if ($explicitVisibility !== null) {
+            try {
+                // forFile() validates its own argument and can itself
+                // throw League\Flysystem\InvalidVisibilityProvided for a
+                // garbage explicit value — deliberately left uncaught
+                // here (it isn't a League\Flysystem\FilesystemException
+                // subtype Amp\File's own catch below matches, and PHP
+                // evaluates it before changePermissions() is even
+                // called): confirmed directly against
+                // League\Flysystem\Local\LocalFilesystemAdapter's own
+                // move(), which doesn't wrap this call either. Letting
+                // it escape as itself, not relabeled as an
+                // UnableToMoveFile it isn't, is the real, documented
+                // Flysystem contract here, not a gap.
+                $this->filesystem->changePermissions($to, $this->visibility->forFile((string) $explicitVisibility));
+            } catch (FilesystemException $e) {
+                throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
+            }
+        }
     }
 
     #[\Override]
@@ -397,11 +663,57 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         $this->assertNoSymlinkBelowRoot($from);
         $this->assertNoSymlinkBelowRoot($to);
 
+        $explicitVisibility = $config->get(Config::OPTION_VISIBILITY);
+        $retainVisibility = (bool) $config->get(Config::OPTION_RETAIN_VISIBILITY, true);
+        $needsSourceMode = $explicitVisibility === null && $retainVisibility;
+
+        // Filesystem::copy()'s default identical-path resolution
+        // (ResolveIdenticalPathConflict::TRY) still delegates all the
+        // way here — FAIL/IGNORE are both resolved entirely by the
+        // Filesystem facade before it ever calls this method, so this
+        // adapter never sees either. Below, openFile($to, 'w') would
+        // truncate $to before pipe() ever reads a single byte from
+        // $from — for a same-path "copy" that's the identical inode,
+        // silent, destructive data loss for what's promised to be a
+        // no-op. The byte copy is skipped entirely, matching
+        // League\Flysystem\Local\LocalFilesystemAdapter's own copy(),
+        // which guards the same case (`$sourcePath !== $destinationPath`)
+        // before ever calling PHP's own copy() — only the visibility
+        // step still runs, and only for an explicit override: see
+        // reapplySameOriginVisibility()'s own docblock for why
+        // retain_visibility is deliberately never consulted here at all.
+        if ($from === $to) {
+            $this->reapplySameOriginVisibility($source, $destination, $to, $explicitVisibility);
+
+            return;
+        }
+
+        // A single pre-open stat narrows the original after-the-copy
+        // race but doesn't close it: nothing bound that captured mode to
+        // the bytes actually read afterward — a source replaced with
+        // different content between the stat and openFile() would still
+        // have its *old* mode applied to the *new* bytes. Amp\File\File
+        // (the handle openFile() returns) exposes no fstat-on-handle at
+        // all to bind metadata to what's actually opened instead
+        // (confirmed via reflection: getMode() returns the *open* mode,
+        // 'r'/'w', never Unix permission bits) — so the best available
+        // protocol is to stat as close to the open as possible, then
+        // stat again after the byte copy and refuse to apply anything
+        // unless both agree. See verifiedSourceStatus()'s own docblock
+        // for the one further limitation even that leaves — a real,
+        // disclosed one, not a claim this closes the race outright.
+        /** @var array<string, mixed>|null $beforeStatus */
+        $beforeStatus = null;
+
         try {
             $this->ensureParentDirectoryExists($to, $config);
             $readHandle = $this->filesystem->openFile($from, 'r');
 
             try {
+                if ($needsSourceMode) {
+                    $beforeStatus = $this->filesystem->getStatus($from);
+                }
+
                 $writeHandle = $this->filesystem->openFile($to, 'w');
 
                 try {
@@ -415,6 +727,228 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         } catch (FilesystemException|StreamException $e) {
             throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
         }
+
+        // The bytes above are a legitimate copy regardless of what
+        // follows: a file descriptor is bound to the inode it opened,
+        // not the path string, so they genuinely reflect whatever that
+        // handle actually read no matter what happened to the path
+        // afterward. What's still in question is only the *visibility*
+        // about to be applied — but openFile($to, 'w') already created
+        // $to at whatever the adapter/umask default happens to be
+        // (public-leaning on most real deployments), so simply skipping
+        // the chmod on a verification failure and leaving that file in
+        // place would be exactly the "a possibly-private source ends up
+        // more exposed than intended" outcome this fix exists to close,
+        // just via the default creation mode instead of an explicitly
+        // wrong one. Explicit cleanup, not left ambiguous: the catch
+        // below deletes $to before rethrowing, best-effort — a failure
+        // deleting it is a distinct, secondary problem that must never
+        // mask or replace the real one being reported.
+        try {
+            $sourceStatus = $needsSourceMode ? $this->verifiedSourceStatus($from, $beforeStatus) : null;
+            $visibilityToApply = $this->resolveCopyVisibility(
+                $source,
+                $explicitVisibility !== null ? (string) $explicitVisibility : null,
+                $retainVisibility,
+                $sourceStatus,
+            );
+
+            if ($visibilityToApply !== null) {
+                // See move()'s own identical comment: forFile() can
+                // throw League\Flysystem\InvalidVisibilityProvided for a
+                // garbage explicit value, deliberately left uncaught
+                // here to match League\Flysystem\Local\LocalFilesystemAdapter's
+                // own copy(), which doesn't wrap this call either.
+                $this->filesystem->changePermissions($to, $this->visibility->forFile($visibilityToApply));
+            }
+        } catch (FilesystemException|UnableToRetrieveMetadata $e) {
+            try {
+                $this->filesystem->deleteFile($to);
+            } catch (FilesystemException) {
+                // Best-effort; the original failure below is what's reported.
+            }
+
+            throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
+        }
+    }
+
+    /**
+     * Re-stats $from after the byte copy and returns $before only when
+     * the two observations agree on mode — never $after itself, and
+     * never a best-of-both merge, so resolveCopyVisibility() always
+     * reasons about one single, internally-consistent observation.
+     * Disagreement, a vanished path, or unresolvable metadata on either
+     * side all collapse to the same null resolveCopyVisibility() already
+     * treats as a genuine failure — this method only ever decides
+     * whether the two observations are trustworthy together, never
+     * whether that's an acceptable outcome.
+     *
+     * Best-effort, not a closed race — a real, disclosed limit, the same
+     * kind this class's own "Not a security boundary against a
+     * concurrent actor" docblock section already states for the symlink
+     * checks, for the identical structural reason: a check and the
+     * operation it protects are always separated by at least one more
+     * syscall, and closing that fully needs the same kernel-level,
+     * handle-bound primitive (openat()/a real fstat-on-handle) that
+     * section already explains PHP exposes no binding for here either.
+     * One further limitation specific to this pair of calls, found by
+     * reading Amp\File's real source rather than assumed: both go
+     * through Amp\File\Driver\StatusCachingFilesystemDriver, which
+     * caches a getStatus() result per path for one second, invalidated
+     * only by an operation *this same process* performs against that
+     * path afterward (changePermissions()/write()/deleteFile()/etc.) —
+     * reading $from, all copy() itself ever does to it, never
+     * invalidates the entry. So these two calls reliably detect a
+     * same-process race (a second Fiber/request handled by the same
+     * persistent worker changing the source in between — a real,
+     * meaningful scenario under this framework's own primary FrankenPHP
+     * worker model, where many requests share one process), but not a
+     * source modified by a genuinely separate process/worker within that
+     * window, since nothing invalidates this process's own cache for a
+     * change it never made.
+     *
+     * @param array<string, mixed> $before
+     * @return array<string, mixed>|null
+     */
+    private function verifiedSourceStatus(string $from, ?array $before): ?array
+    {
+        if ($before === null) {
+            return null;
+        }
+
+        $after = $this->filesystem->getStatus($from);
+
+        return self::sourceModeUnchanged($before, $after) ? $before : null;
+    }
+
+    /**
+     * True only when both $before and $after report the identical,
+     * genuinely-known file type *and* permission bits — the pure
+     * comparison verifiedSourceStatus() defers to, kept filesystem-free
+     * so it's directly, deterministically testable with fabricated
+     * status arrays rather than needing a real race to exercise. Type
+     * and permission are checked as two separate, explicit comparisons
+     * rather than one combined bitmask specifically so a path that
+     * became a directory or a symlink between the two stats — while
+     * coincidentally sharing the same low 9 permission bits as the
+     * original regular file — is correctly treated as changed, not
+     * masked away by only ever comparing `& 0777`. $after being null
+     * (the path no longer resolves), or either side missing a mode or
+     * reporting a non-int one, all count as "changed" too — unknown is
+     * never treated as unchanged.
+     *
+     * @param array<string, mixed> $before
+     * @param array<string, mixed>|null $after
+     */
+    private static function sourceModeUnchanged(array $before, ?array $after): bool
+    {
+        if ($after === null) {
+            return false;
+        }
+
+        $beforeMode = $before['mode'] ?? null;
+        $afterMode = $after['mode'] ?? null;
+
+        if (!\is_int($beforeMode) || !\is_int($afterMode)) {
+            return false;
+        }
+
+        return ($beforeMode & self::TYPE_MASK) === ($afterMode & self::TYPE_MASK)
+            && ($beforeMode & 0777) === ($afterMode & 0777);
+    }
+
+    /**
+     * copy()'s identical-source-and-destination branch. There is no
+     * separate destination here to retain anything *onto* — $to is
+     * $from — so retain_visibility (whether true or false) has nothing
+     * to do and is never consulted: only an explicit override touches
+     * the file's mode. Reading the file's own current mode back through
+     * inverseForFile() and reapplying it, the way the normal copy path
+     * does for genuine retention, would silently canonicalize a real
+     * but non-canonical mode (0640, say) to Visibility::PUBLIC's own
+     * 0644 the moment inverseForFile() fails to recognize it as one of
+     * the two values it knows — broadening a file's permissions with no
+     * explicit request to do so at all. Skipping the read-and-reapply
+     * entirely for the no-explicit-visibility case is what avoids that.
+     *
+     * A visibility failure here never deletes the file — unlike the
+     * normal path's catch-and-delete, $to *is* the source, the only
+     * existing copy of the data, so deleting it on a permission-change
+     * failure would be real data loss. The same reasoning move()'s own
+     * no-rollback catch already documents for the identical structural
+     * reason.
+     */
+    private function reapplySameOriginVisibility(
+        string $source,
+        string $destination,
+        string $to,
+        mixed $explicitVisibility,
+    ): void {
+        if ($explicitVisibility === null) {
+            return;
+        }
+
+        try {
+            // See copy()'s own identical comment on its main path:
+            // forFile() can throw League\Flysystem\InvalidVisibilityProvided
+            // for a garbage explicit value, deliberately left uncaught
+            // here too, matching LocalFilesystemAdapter's own copy(),
+            // which doesn't wrap this call either.
+            $this->filesystem->changePermissions($to, $this->visibility->forFile((string) $explicitVisibility));
+        } catch (FilesystemException $e) {
+            throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
+        }
+    }
+
+    /**
+     * Decides which visibility (if any) copy() should apply to the
+     * destination — a small, pure decision with no filesystem access of
+     * its own, deliberately kept separate from the getStatus() call
+     * itself. That separation is what makes the one invariant that
+     * actually matters — unresolvable source metadata must never
+     * silently become Visibility::PUBLIC — directly and deterministically
+     * testable: Amp\File\Filesystem is `final`, offering no seam to fake
+     * a real getStatus() failure through, but this method needs no real
+     * filesystem at all to prove its own null-handling.
+     *
+     * $sourceStatus is expected to already be verifiedSourceStatus()'s
+     * own output (or null), so a mismatched/vanished/unresolvable source
+     * has already collapsed to null by the time this runs — this method
+     * never itself distinguishes "never resolvable" from "resolvable but
+     * untrustworthy," both are the identical failure from here.
+     *
+     * @param array<string, mixed>|null $sourceStatus
+     * @throws UnableToRetrieveMetadata when retention is needed but
+     *   $sourceStatus is null, or its mode is missing or not an int —
+     *   unknown metadata is a genuine failure in every one of those
+     *   shapes, never mode 0, which inverseForFile() would otherwise map
+     *   to Visibility::PUBLIC same as a real 0644/0600 match. Not
+     *   assumed safe just because every Amp\File driver installed today
+     *   happens to always populate an int mode — checked explicitly
+     *   regardless, since nothing in the driver's own contract actually
+     *   guarantees that.
+     */
+    private function resolveCopyVisibility(
+        string $source,
+        ?string $explicitVisibility,
+        bool $retainVisibility,
+        ?array $sourceStatus,
+    ): ?string {
+        if ($explicitVisibility !== null) {
+            return $explicitVisibility;
+        }
+
+        if (!$retainVisibility) {
+            return null;
+        }
+
+        $mode = $sourceStatus['mode'] ?? null;
+
+        if (!\is_int($mode)) {
+            throw UnableToRetrieveMetadata::visibility($source, 'source status could not be retrieved');
+        }
+
+        return $this->visibility->inverseForFile($mode & 0777);
     }
 
     /**
@@ -568,12 +1102,42 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
             : $this->visibility->defaultForDirectories();
     }
 
-    private function applyFileVisibility(string $location, Config $config): void
+    /**
+     * Called by write()/writeStream() only from their outer catch —
+     * after their own finally has already closed the Amp\File\File
+     * handle openFile('w') returned, deliberately: unlinking a file
+     * with a still-open handle works on POSIX, but this is not a
+     * portable guarantee to lean on, since Windows commonly refuses to
+     * unlink one. $modeFailed distinguishes a changePermissions()
+     * failure from any other failure in the same try (a body-write I/O
+     * error, a directory-creation failure) — only a mode failure gets
+     * this cleanup; a body-write failure leaves whatever partial
+     * content already landed, unchanged from write()/writeStream()'s
+     * behavior with no visibility requested at all, since a partial
+     * write under the *correct*, already-applied mode is a data-
+     * integrity concern, not the confidentiality one this exists for.
+     * $existedBefore then decides whether deleting is even safe: never
+     * for what was an overwrite (its old content is already gone to
+     * openFile('w')'s own truncation regardless of whether the mode
+     * change ever ran, so deleting the now-empty file would only
+     * remove the last trace a path existed there at all — the same
+     * "the destination is the only remaining copy" reasoning move()
+     * already applies), but always for what was genuinely new, where
+     * deleting just undoes the call and leaves nothing where nothing
+     * existed before it started. Best-effort: a failure deleting is
+     * silently absorbed, since the original mode failure is what
+     * write()/writeStream() actually report.
+     */
+    private function deleteIfNewAfterModeFailure(string $location, bool $modeFailed, bool $existedBefore): void
     {
-        $visibility = $config->get(Config::OPTION_VISIBILITY);
+        if (!$modeFailed || $existedBefore) {
+            return;
+        }
 
-        if ($visibility !== null) {
-            $this->filesystem->changePermissions($location, $this->visibility->forFile($visibility));
+        try {
+            $this->filesystem->deleteFile($location);
+        } catch (FilesystemException) {
+            // Best-effort; the original failure is what's reported.
         }
     }
 
