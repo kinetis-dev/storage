@@ -14,7 +14,8 @@
         "league/flysystem": "^3.35.2",
         "league/mime-type-detection": "^1.17.0",
         "amphp/file": "^3.2.0",
-        "amphp/byte-stream": "^2.1.2"
+        "amphp/byte-stream": "^2.1.2",
+        "amphp/parallel": "^2.4.0"
     },
     "require-dev": {
         "infection/infection": "^0.35.0",

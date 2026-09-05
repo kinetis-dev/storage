@@ -30,6 +30,11 @@ use Throwable;
  * - Failures outside every catch list this adapter names: $moveThrows
  *   and $writeThrows raise an arbitrary Throwable from the rename and
  *   from the wrapped handle's write().
+ * - The two amphp/file paths that translate nothing:
+ *   $openFileThrowsForModes and $closeThrowsForModes raise an arbitrary
+ *   Throwable from an open and from a close, which is how a real
+ *   Amp\Parallel worker or task failure surfaces from
+ *   ParallelFilesystemDriver::openFile() and ParallelFile::close().
  * - Writes that lose bytes: $failWriteAfterBytes truncates and throws,
  *   $dropWritesAfterBytes truncates and returns normally.
  * - Rename outcomes a failed rename cannot distinguish on its own:
@@ -73,6 +78,29 @@ final class SelectivelyFailingFilesystemDriver implements FilesystemDriver
      * that succeeded fails the operation.
      */
     public bool $rejectSecondClose = false;
+
+    /**
+     * Thrown from openFile() instead of reaching the real driver, keyed
+     * by the open mode ('x' for a staged file, 'r' for a source or a
+     * mime-type sample). This is where a worker acquisition failure
+     * lands: ParallelFilesystemDriver::openFile() pulls a worker from
+     * the pool before the try that wraps the open task, so the pool's
+     * own failure arrives with no Amp\File type around it.
+     *
+     * @var array<string, Throwable>
+     */
+    public array $openFileThrowsForModes = [];
+
+    /**
+     * Thrown from a wrapped handle's close(), keyed by the same open
+     * mode — $failCloseForModes with an arbitrary type instead of a
+     * StreamException. ParallelFile::close() submits its fclose task
+     * without wrapping anything, so a real worker or task failure
+     * reaches a caller exactly like this.
+     *
+     * @var array<string, Throwable>
+     */
+    public array $closeThrowsForModes = [];
 
 
 
@@ -251,6 +279,10 @@ final class SelectivelyFailingFilesystemDriver implements FilesystemDriver
     {
         $this->calls[] = "openFile:{$mode}:{$path}";
         ($this->beforeOpenFile)($path, $mode);
+
+        if (isset($this->openFileThrowsForModes[$mode])) {
+            throw $this->openFileThrowsForModes[$mode];
+        }
 
         return $this->lastOpenedHandle = new SelectivelyFailingFile($this->real->openFile($path, $mode), $this, $mode, $path);
     }

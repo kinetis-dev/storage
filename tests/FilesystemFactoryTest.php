@@ -83,6 +83,21 @@ final class FilesystemFactoryTest extends TestCase
         FilesystemFactory::fromConfig($config);
     }
 
+    /**
+     * A key that is present but empty is a different failure from a
+     * missing one, and it is the dangerous one: an empty root leaves
+     * every path relative to whatever working directory the worker holds.
+     * AmpFileAdapter refuses it, so the factory never builds one.
+     */
+    public function test_an_empty_root_throws_rather_than_resolving_against_the_working_directory(): void
+    {
+        $config = new Config(['FILESYSTEM_ROOT' => '']);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('root');
+        FilesystemFactory::fromConfig($config);
+    }
+
     public function test_an_unknown_driver_throws_a_clear_error(): void
     {
         $config = new Config(['FILESYSTEM_DRIVER' => 'gcs']);
