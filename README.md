@@ -58,7 +58,7 @@ is scoped.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `FILESYSTEM_DRIVER` | `local` | `local`, or `s3` (needs [`kinetis/storage-s3`](https://github.com/kinetis-dev/storage-s3)). |
+| `FILESYSTEM_DRIVER` | *(unset)* | `local`, or `s3` (needs [`kinetis/storage-s3`](https://github.com/kinetis-dev/storage-s3)). Unset binds nothing; `FilesystemFactory::fromConfig()`, called directly, falls back to `local`. |
 | `FILESYSTEM_ROOT` | *(required for local)* | Local disk root path. |
 
 Scoped keys follow the named-connection convention — the connection
