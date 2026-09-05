@@ -17,7 +17,8 @@ use function Amp\File\filesystem;
  * 'local' needs nothing external to guess wrong against, unlike
  * DB_CONNECTION/QUEUE_CONNECTION, which is why this one has a default and
  * those don't) plus FILESYSTEM_ROOT (required — a wrong guessed root
- * could write files somewhere unintended).
+ * could write files somewhere unintended). A key that is set but empty
+ * reaches AmpFileAdapter, which refuses it; see that class for why.
  *
  * $connection selects a named connection via Config::scopedKey() — see
  * that class's own docblock. A named filesystem is never autowired by

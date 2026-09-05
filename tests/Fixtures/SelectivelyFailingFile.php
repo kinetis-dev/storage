@@ -19,12 +19,15 @@ use IteratorAggregate;
  * Amp\ByteStream\StreamException on demand — the smallest available seam
  * for forcing a deterministic stream-level failure while a file is open,
  * since File itself has no injectable constructor the way
- * Amp\File\Filesystem does. Read via the enclosing driver's own
- * $failRead/$failWriteAfterBytes/$dropWritesAfterBytes/
- * $failCloseForModes properties rather than a copy taken at construction
- * time, so a test can flip any of them after the handle has already been
- * opened. close() records every call against this handle's own open mode
- * and path first, so a test can assert which handles were attempted even
+ * Amp\File\Filesystem does. close() additionally raises whatever
+ * $closeThrowsForModes names for this handle's mode, which is how a
+ * real ParallelFile::close() failure arrives — it submits its fclose
+ * task with no Amp\File or Amp\ByteStream type wrapped around a worker
+ * or task failure. Every seam is read via the enclosing driver's own
+ * properties rather than a copy taken at construction time, so a test
+ * can flip any of them after the handle has already been opened.
+ * close() records every call against this handle's own open mode and
+ * path first, so a test can assert which handles were attempted even
  * when one of them throws.
  *
  * write() is both write seams at once:
@@ -88,6 +91,10 @@ final class SelectivelyFailingFile implements File, IteratorAggregate
         }
 
         ++$this->closes;
+
+        if (isset($this->driver->closeThrowsForModes[$this->mode])) {
+            throw $this->driver->closeThrowsForModes[$this->mode];
+        }
 
         if (\in_array($this->mode, $this->driver->failCloseForModes, true)) {
             throw new StreamException("simulated close failure for the '{$this->mode}' handle");

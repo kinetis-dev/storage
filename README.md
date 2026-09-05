@@ -40,6 +40,19 @@ $contents = $storage->read('avatars/user-42.png');
 $storage->delete('avatars/user-42.png');
 ```
 
+Every path is confined to `FILESYSTEM_ROOT` before it becomes a
+filesystem location — a `..` segment, a control byte or a backslash is
+refused with no filesystem call made, on both operands of a `move()` or
+a `copy()`, and so is a write whose destination names the root itself.
+Each operation reports a driver failure as the
+`League\Flysystem\UnableTo*` type its own interface declares — including
+a failure from the worker pool `amphp/file` runs its calls in — while a
+policy outcome (`PathTraversalDetected`, `CorruptedPathDetected`,
+`SymbolicLinkEncountered`, `InvalidVisibilityProvided`) and a programmer
+error both keep their own type. Symlinks are checked, with a disclosed
+limit that is not a security boundary against a concurrent writer:
+[kinetis.dev/docs/storage.html](https://kinetis.dev/docs/storage.html).
+
 ## Provides
 
 Installing this package auto-registers, via `extra.kinetis`:
@@ -59,7 +72,7 @@ is scoped.
 | Key | Default | Purpose |
 |---|---|---|
 | `FILESYSTEM_DRIVER` | *(unset)* | `local`, or `s3` (needs [`kinetis/storage-s3`](https://github.com/kinetis-dev/storage-s3)). Unset binds nothing; `FilesystemFactory::fromConfig()`, called directly, falls back to `local`. |
-| `FILESYSTEM_ROOT` | *(required for local)* | Local disk root path. |
+| `FILESYSTEM_ROOT` | *(required for local)* | Local disk root path. Must be non-empty; `/` is valid. |
 
 Scoped keys follow the named-connection convention — the connection
 name inserts after the first segment: `FILESYSTEM_ROOT` + `uploads` → `FILESYSTEM_UPLOADS_ROOT`.
