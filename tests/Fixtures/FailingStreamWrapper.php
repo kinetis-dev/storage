@@ -4,13 +4,16 @@ declare(strict_types=1);
 
 namespace Kinetis\Storage\Tests\Fixtures;
 
+use Amp\ByteStream\StreamException;
+
 /**
  * A registered PHP stream wrapper (protocol self::PROTOCOL) whose
- * write()/seek() behavior is fully controlled via stream context
+ * read()/write()/seek() behavior is fully controlled via stream context
  * options — the deterministic seam AmpFileAdapterTest uses to simulate a
- * short write, a failed write, or a failed rewind() against a real PHP
- * resource, without needing to exhaust a real one (memory, disk, file
- * descriptors) to trigger a failure.
+ * short write, a failed write, a failed rewind(), or a source that dies
+ * partway through being read, against a real PHP resource, without
+ * needing to exhaust a real one (memory, disk, file descriptors) to
+ * trigger a failure.
  *
  * Backed by a plain in-memory buffer plus a read/write position, the
  * same semantics a real php://temp stream has for the subset of
@@ -27,6 +30,16 @@ namespace Kinetis\Storage\Tests\Fixtures;
  *   normally.
  * - failSeek: bool — when true, every stream_seek() call (what
  *   rewind() uses) fails.
+ * - contents: string — the buffer the stream starts holding, for use as
+ *   a source rather than a destination.
+ * - throwOnReadAfterBytes: int — once this many bytes have been read
+ *   out, every further read throws a real
+ *   Amp\ByteStream\StreamException instead of returning data. An
+ *   exception thrown inside a stream wrapper propagates out through
+ *   fread() itself, which is what makes this a genuine mid-stream
+ *   source failure rather than an early EOF: writeStream()'s pipe()
+ *   sees bytes land and then a hard failure, exactly as a real dying
+ *   source would produce.
  *
  * PHP instantiates this class itself the moment fopen() is called
  * against the registered protocol — there is no constructor to pass
@@ -51,6 +64,8 @@ final class FailingStreamWrapper
 
     private bool $failSeek = false;
 
+    private ?int $throwOnReadAfterBytes = null;
+
     public static function register(): void
     {
         if (!\in_array(self::PROTOCOL, \stream_get_wrappers(), true)) {
@@ -65,6 +80,8 @@ final class FailingStreamWrapper
 
         $this->writeReturns = $config['writeReturns'] ?? [];
         $this->failSeek = $config['failSeek'] ?? false;
+        $this->buffer = $config['contents'] ?? '';
+        $this->throwOnReadAfterBytes = $config['throwOnReadAfterBytes'] ?? null;
 
         return true;
     }
@@ -94,6 +111,10 @@ final class FailingStreamWrapper
 
     public function stream_read(int $count): string
     {
+        if ($this->throwOnReadAfterBytes !== null && $this->position >= $this->throwOnReadAfterBytes) {
+            throw new StreamException('simulated source read failure');
+        }
+
         $chunk = \substr($this->buffer, $this->position, $count);
         $this->position += \strlen($chunk);
 
@@ -129,6 +150,16 @@ final class FailingStreamWrapper
     public function stream_stat(): array
     {
         return [];
+    }
+
+    /**
+     * Amp\ByteStream\ReadableResourceStream calls stream_set_blocking()
+     * on any resource handed to it, which reaches a userland wrapper
+     * here; without this the call fails and the stream is unusable.
+     */
+    public function stream_set_option(int $option, ?int $arg1, ?int $arg2): bool
+    {
+        return true;
     }
 
     public function stream_close(): void
