@@ -9,6 +9,7 @@ use Amp\File\FilesystemException;
 use Closure;
 use InvalidArgumentException;
 use Kinetis\Storage\AmpFileAdapter;
+use Kinetis\Storage\Exception\ReservedPathDetected;
 use Kinetis\Storage\Tests\Fixtures\RecordingFilesystemDriver;
 use League\Flysystem\Config;
 use League\Flysystem\CorruptedPathDetected;
@@ -145,6 +146,12 @@ final class AmpFileAdapterConfinementTest extends TestCase
         yield 'a backslash traversal' => ['..\\escape.txt', CorruptedPathDetected::class];
         yield 'a NUL byte' => ["escape.txt\0", CorruptedPathDetected::class];
         yield 'a newline' => ["a\nb.txt", CorruptedPathDetected::class];
+
+        // The reserved staging directory name, refused by every
+        // operation on every operand. ConfinedPathTest holds the
+        // grammar boundary.
+        yield 'a staging directory name' => ['.kinetis-stage.0123456789abcdef0123456789abcdef', ReservedPathDetected::class];
+        yield 'a staging directory name nested deeper' => ['dir/.kinetis-stage.0123456789abcdef0123456789abcdef/entry.txt', ReservedPathDetected::class];
     }
 
     /**

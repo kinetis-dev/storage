@@ -54,12 +54,15 @@ stored length matches, so a reader sees the whole old file or the whole
 new one and a call that fails before that rename leaves the destination
 as it was. A failure reported by the rename itself leaves the
 publication outcome unknown, a retry hazard the documentation below
-states in full. Each operation reports a driver failure as the
+states in full. That directory's name is reserved: no listing reports
+one at any depth, a recursive deletion still removes it, and a path
+naming one is refused. Each operation reports a driver failure as the
 `League\Flysystem\UnableTo*` type its own interface declares, while a
 policy outcome (`PathTraversalDetected`, `CorruptedPathDetected`,
-`SymbolicLinkEncountered`, `InvalidVisibilityProvided`) and a programmer
-error both keep their own type. Symlinks are checked, with a disclosed
-limit that is not a security boundary against a concurrent writer:
+`SymbolicLinkEncountered`, `ReservedPathDetected`,
+`InvalidVisibilityProvided`) and a programmer error both keep their own
+type. Symlinks are checked, with a disclosed limit that is not a
+security boundary against a concurrent writer:
 [kinetis.dev/docs/storage.html](https://kinetis.dev/docs/storage.html).
 
 ## Provides

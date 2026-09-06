@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Kinetis\Storage\Tests;
 
 use Kinetis\Storage\ConfinedPath;
+use Kinetis\Storage\Exception\ReservedPathDetected;
 use League\Flysystem\CorruptedPathDetected;
 use League\Flysystem\PathTraversalDetected;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -12,6 +13,9 @@ use PHPUnit\Framework\TestCase;
 
 final class ConfinedPathTest extends TestCase
 {
+    /** 32 lowercase hexadecimal digits: the tail a staging directory name carries. */
+    private const string HEX = '0123456789abcdef0123456789abcdef';
+
     /**
      * @return iterable<string, array{string, string, list<string>}>
      */
@@ -89,6 +93,60 @@ final class ConfinedPathTest extends TestCase
     {
         $this->expectException(CorruptedPathDetected::class);
         ConfinedPath::from($path);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function reservedPaths(): iterable
+    {
+        yield 'a staging directory itself' => ['.kinetis-stage.' . self::HEX];
+        yield 'the staged file inside one' => ['.kinetis-stage.' . self::HEX . '/staged'];
+        yield 'one nested below an ordinary directory' => ['uploads/.kinetis-stage.' . self::HEX];
+        yield 'one in the middle of a deeper path' => ['a/b/.kinetis-stage.' . self::HEX . '/c/d.txt'];
+        yield 'a tail of a different value' => ['.kinetis-stage.ffffffffffffffffffffffffffffffff'];
+    }
+
+    /**
+     * The name AmpFileAdapter publishes through is reserved, and the
+     * refusal lives here rather than in each operation, since every
+     * operand of every operation is admitted through from().
+     */
+    #[DataProvider('reservedPaths')]
+    public function test_a_reserved_staging_path_is_refused(string $path): void
+    {
+        $this->expectException(ReservedPathDetected::class);
+        ConfinedPath::from($path);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function nearMissNames(): iterable
+    {
+        yield 'the prefix alone' => ['.kinetis-stage'];
+        yield 'the prefix with no tail' => ['.kinetis-stage.'];
+        yield 'a tail one digit short' => ['.kinetis-stage.' . substr(self::HEX, 1)];
+        yield 'a tail one digit long' => ['.kinetis-stage.' . self::HEX . 'a'];
+        yield 'an uppercase tail' => ['.kinetis-stage.' . strtoupper(self::HEX)];
+        yield 'a non-hexadecimal tail' => ['.kinetis-stage.' . substr(self::HEX, 1) . 'z'];
+        yield 'an extension after the name' => ['.kinetis-stage.' . self::HEX . '.txt'];
+        yield 'the name without its leading dot' => ['kinetis-stage.' . self::HEX];
+        yield 'the name as a substring of a longer one' => ['pre.kinetis-stage.' . self::HEX];
+    }
+
+    /**
+     * The grammar boundary: the reserved name is the whole name, so
+     * everything one character away from it is an ordinary path a caller
+     * owns, admitted unchanged as a single segment.
+     */
+    #[DataProvider('nearMissNames')]
+    public function test_a_name_the_staging_grammar_does_not_match_whole_is_admitted(string $name): void
+    {
+        $confined = ConfinedPath::from($name);
+
+        self::assertSame($name, $confined->path);
+        self::assertSame([$name], $confined->segments);
     }
 
     /**

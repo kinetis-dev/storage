@@ -97,6 +97,11 @@ use function Amp\ByteStream\pipe;
  * write(), writeStream() and copy() publish through publish(), which
  * builds the new content in a private directory beside the destination
  * and renames it into place. See {doc}`storage`.
+ *
+ * That directory's name is the adapter's own, and StagingName is the one
+ * grammar it is read by: listContents() reports no entry carrying it at
+ * any depth or in either mode, ConfinedPath refuses a caller's path
+ * naming one, and recursive deletion still walks and removes them.
  */
 final readonly class AmpFileAdapter implements FilesystemAdapter
 {
@@ -817,6 +822,14 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     private function listContentsRecursively(string $location, string $logical, bool $deep): iterable
     {
         foreach ($this->filesystem->listFiles($location) as $name) {
+            // A staging directory is neither reported nor descended
+            // into, which is what keeps the partially written file
+            // inside one out of a deep listing too. Ahead of the
+            // symlink check below: this walk never follows one anyway.
+            if (StagingName::matches($name)) {
+                continue;
+            }
+
             $entryLocation = $location . '/' . $name;
             $publicPath = $logical === '' ? $name : $logical . '/' . $name;
 
@@ -889,6 +902,10 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
      * any entry anywhere in it is a symlink — before anything has been
      * deleted.
      *
+     * Every entry, a staging directory hidden from listContents()
+     * included: rmdir(2) refuses a directory that still holds anything,
+     * so a skipped leftover would leave its parent undeletable.
+     *
      * @return array{files: list<string>, directories: list<string>}
      */
     private function planRecursiveDeletion(string $location, string $logical): array
@@ -951,7 +968,7 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     {
         $this->ensureParentDirectoryExists($to, $config);
 
-        $staging = \dirname($to) . '/.kinetis-stage.' . \bin2hex(\random_bytes(16));
+        $staging = \dirname($to) . '/' . StagingName::generate();
         $this->filesystem->createDirectory($staging, self::STAGING_DIRECTORY_MODE);
         $staged = $staging . '/' . self::STAGED_FILE_NAME;
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kinetis\Storage;
 
+use Kinetis\Storage\Exception\ReservedPathDetected;
 use League\Flysystem\CorruptedPathDetected;
 use League\Flysystem\PathTraversalDetected;
 
@@ -37,6 +38,10 @@ use League\Flysystem\PathTraversalDetected;
  *   below reads it as an ordinary filename byte while a caller, Windows
  *   and WhitespacePathNormalizer all read it as a separator, and one
  *   path with two readings is what a confinement check cannot carry.
+ * - A segment matching StagingName's grammar, at any depth, throws
+ *   Kinetis\Storage\Exception\ReservedPathDetected. That name is
+ *   AmpFileAdapter's own, and admitting every operand here is what makes
+ *   the reservation one rule no operation restates.
  *
  * A `.` segment and a repeated, leading or trailing separator name no
  * location of their own and are dropped, so `a//b/` and `a/./b` both
@@ -59,6 +64,8 @@ final readonly class ConfinedPath
      * @throws PathTraversalDetected when a segment is `..`
      * @throws CorruptedPathDetected when the path carries a control byte
      *   or a backslash
+     * @throws ReservedPathDetected when a segment is a staging
+     *   directory name
      */
     public static function from(string $path): self
     {
@@ -73,9 +80,15 @@ final readonly class ConfinedPath
                 throw PathTraversalDetected::forPath($path);
             }
 
-            if ($segment !== '' && $segment !== '.') {
-                $segments[] = $segment;
+            if ($segment === '' || $segment === '.') {
+                continue;
             }
+
+            if (StagingName::matches($segment)) {
+                throw ReservedPathDetected::forPath($path, $segment);
+            }
+
+            $segments[] = $segment;
         }
 
         return new self(\implode('/', $segments), $segments);
