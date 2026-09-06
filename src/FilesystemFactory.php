@@ -4,12 +4,13 @@ declare(strict_types=1);
 
 namespace Kinetis\Storage;
 
+use Amp\File\Filesystem as AmpFilesystem;
 use InvalidArgumentException;
 use Kinetis\Config\Config;
 use Kinetis\Storage\Exception\StorageUnavailableException;
 use League\Flysystem\Filesystem;
 
-use function Amp\File\filesystem;
+use function Amp\File\createDefaultDriver;
 
 /**
  * Builds a League\Flysystem\Filesystem from Config — FILESYSTEM_DRIVER
@@ -24,6 +25,22 @@ use function Amp\File\filesystem;
  * that class's own docblock. A named filesystem is never autowired by
  * type; retrieve it from the container explicitly, or construct it
  * directly, wherever it's needed.
+ *
+ * The local driver is built on Amp\File\createDefaultDriver() rather
+ * than Amp\File\filesystem(), which wraps that driver in
+ * StatusCachingFilesystemDriver: a positive stat cached per path for
+ * 1000 seconds and invalidated only by mutations through the same
+ * instance. Under a persistent worker that makes fileExists(),
+ * fileSize(), lastModified() and visibility() report a file another
+ * thread, another process or an external writer has already deleted or
+ * rewritten. Each Filesystem built here therefore owns its driver and,
+ * with neither ext-uv nor ext-eio loaded, that driver's own pool of up
+ * to eight worker processes — one pool per instance built here, and one
+ * more for every named connection alongside it. So build an instance
+ * per process or thread and hold it for the application's lifetime
+ * rather than per request, which is what the container binding does.
+ * AmpFileAdapter accepts any Amp\File\Filesystem, so a consumer wanting
+ * the cache can construct one with it directly.
  *
  * FILESYSTEM_DRIVER=s3 is class_exists()-gated against
  * Kinetis\StorageS3\S3FilesystemFactory rather than a direct reference,
@@ -44,7 +61,7 @@ final class FilesystemFactory
 
         return match ($driver) {
             'local' => new Filesystem(new AmpFileAdapter(
-                filesystem(),
+                new AmpFilesystem(createDefaultDriver()),
                 $config->required(Config::scopedKey('FILESYSTEM_ROOT', $connection)),
             )),
             's3' => self::s3Filesystem($config, $connection),

@@ -5,21 +5,17 @@ declare(strict_types=1);
 namespace Kinetis\Storage;
 
 use Amp\ByteStream\ReadableResourceStream;
-use Amp\ByteStream\StreamException;
 use Amp\File\File;
 use Amp\File\Filesystem;
-use Amp\File\FilesystemException;
-use Amp\Parallel\Context\ContextException;
-use Amp\Parallel\Worker\TaskFailureException;
-use Amp\Parallel\Worker\WorkerException;
 use Closure;
+use Exception;
 use InvalidArgumentException;
-use Kinetis\Storage\Exception\IndeterminatePublicationException;
 use League\Flysystem\Config;
 use League\Flysystem\CorruptedPathDetected;
 use League\Flysystem\DirectoryAttributes;
 use League\Flysystem\FileAttributes;
 use League\Flysystem\FilesystemAdapter;
+use League\Flysystem\FilesystemException;
 use League\Flysystem\PathTraversalDetected;
 use League\Flysystem\StorageAttributes;
 use League\Flysystem\SymbolicLinkEncountered;
@@ -39,229 +35,104 @@ use League\Flysystem\UnixVisibility\PortableVisibilityConverter;
 use League\Flysystem\UnixVisibility\VisibilityConverter;
 use League\MimeTypeDetection\FinfoMimeTypeDetector;
 use League\MimeTypeDetection\MimeTypeDetector;
+use RuntimeException;
 use Throwable;
 
 use function Amp\ByteStream\pipe;
 
 /**
  * A League\Flysystem\FilesystemAdapter for local disk backed by
- * Amp\File\Filesystem instead of Flysystem's own (blocking) local adapter
- * — every method here delegates to amphp/file, whose calls suspend the
- * calling Fiber via Revolt rather than blocking the whole worker process,
- * the same non-blocking idiom Amp\Mysql/Amp\Redis already use throughout
- * Kinetis\Persistence. Flysystem's own FilesystemAdapter interface has
- * plain synchronous-looking method signatures throughout (no Future/
- * promise return types anywhere) — that's not a mismatch, since
- * Amp\File\Filesystem's methods look synchronous too while suspending
- * internally; the Fiber suspends, not the method signature.
+ * Amp\File\Filesystem rather than Flysystem's own local adapter. Every
+ * driver call suspends the calling Fiber via Revolt instead of blocking
+ * the worker process; Flysystem's synchronous-looking signatures are no
+ * mismatch, since Amp\File\Filesystem's methods look synchronous too
+ * while suspending internally.
  *
- * readStream() is the one real, disclosed exception to "genuinely
- * non-blocking throughout": PHP resources are an engine-level type that
- * can't be backed by arbitrary userland code without a registered stream
- * wrapper, so there's no way to hand back a resource that lazily pulls
- * from Amp\File\File on demand. It reads the whole file via the
- * non-blocking read() below, then buffers that into an in-memory
- * `php://temp` resource for the caller — the disk read itself never
- * blocks, but the whole file is loaded into memory up front rather than
- * streamed incrementally. writeStream() and copy() stream via
- * Amp\ByteStream\pipe() between real Amp\File\File handles, with no such
- * compromise; write() hands its string to the staged handle directly.
+ * The two resource-based methods are the disclosed exception, because a
+ * PHP resource cannot be backed by userland code without a registered
+ * stream wrapper. readStream() buffers the whole object into a
+ * `php://temp` resource, which keeps up to 2 MiB in memory and spills
+ * the rest to a temporary file. writeStream() transfers the caller's
+ * resource in bounded chunks and never holds the whole input, reading
+ * it with PHP's own stream functions on the calling thread. Both touch
+ * disk from this thread, and disk reads and writes block it: a
+ * non-blocking resource mode governs sockets and pipes, never a regular
+ * file or a spilled temporary one. {doc}`storage` states both in full.
  *
- * Logical confinement — every operand of every operation, both sides of
- * move() and copy() included, is admitted through ConfinedPath::from()
- * before a location is built from it. That class holds the rules and
- * the reasoning; what matters here is that a location this adapter acts
- * on is always $root followed by the confined path's own segments, so a
- * `..`, a control byte or a backslash never reaches a filesystem call
- * at all. A League\Flysystem\Filesystem in front of this adapter
- * normalizes paths first, and that is not what makes the confinement
- * hold: this class is public and documented for direct use, so the
- * check has to live where the operation does.
+ * Every operand of every operation — both sides of move() and copy()
+ * included — is admitted through ConfinedPath::from() before a location
+ * is built from it, so a `..` segment, a control byte or a backslash
+ * never reaches a filesystem call. A League\Flysystem\Filesystem in
+ * front of this adapter normalizes paths first, and that is not what
+ * makes the confinement hold: this class is public and documented for
+ * direct use, so the check lives where the operation does. A publication
+ * additionally refuses a destination naming the root itself, from the
+ * confined path alone: before the symlink walk, before a parent is
+ * built, and before a caller's stream is read. fileExists(),
+ * directoryExists() and listContents() ask a legitimate question of that
+ * location and keep answering it.
  *
- * A publication refuses one destination beyond those — the root itself,
- * in every spelling that names it (`''`, `.`, `/`, `//`, `/./`), for
- * write(), writeStream() and the destination side of move() and
- * copy(). $root holds no file to publish over, and publishing there
- * would put the staging directory in $root's own *parent*, outside the
- * tree this class is confined to. Refused with the operation's own
- * League exception, and refused from the confined path alone: before
- * the symlink walk, before a parent directory is built, before a
- * source handle is opened or a caller's stream is read, so a refusal
- * costs no filesystem call and consumes no source. fileExists(),
- * directoryExists() and listContents() ask a legitimate question of
- * that location and keep answering it.
+ * $root is required to be non-empty. An empty root would leave every
+ * location relative to whatever working directory the worker process
+ * happens to hold. A root of '/' stays valid, and so does the empty
+ * logical path, which names $root itself.
  *
- * $root is required to be non-empty, checked in the constructor. An
- * empty root would leave every location relative, resolving against
- * whatever working directory the worker process happens to hold —
- * confinement to a directory nobody configured. A root of '/' stays
- * valid, and so does the empty logical path, which names $root itself
- * for listContents('') and directoryExists('').
- *
- * Symlink checks — rejects a symlink observed at check time; this is not
- * the same claim as "a symlink can never be followed", and the
- * distinction matters (see "Not a security boundary" below). Every
- * method that touches a path checks each component of the confined path,
- * from directly under $root down to the target, with
- * Amp\File\Filesystem::isSymlink() (lstat — it inspects the component
- * itself, never what it points to) via assertNoSymlinkBelowRoot(), and
- * refuses with League\Flysystem\SymbolicLinkEncountered the moment any
- * component is one; listContentsRecursively()/deleteDirectoryRecursively()
- * (the latter via planRecursiveDeletion() — see its own docblock) apply
- * the identical check to each entry they discover, which is what also
- * stops a symlink cycle — a rejected entry is never descended into, so
- * there's nothing left to loop on. Confinement and these checks answer
- * two different questions: the first rules out a path that names its way
- * out of $root, the second a path that resolves its way out.
+ * Every method that touches a path walks the confined path one component
+ * at a time, from directly under $root down to the target, with
+ * Amp\File\Filesystem::isSymlink() (lstat: it inspects the component
+ * itself, never what it points to), and refuses a component that is a
+ * symlink. Listing and recursive deletion apply the same check to each
+ * entry they discover, which is also what stops a symlink cycle. A link
+ * created while an operation runs is not detected; {doc}`storage` states
+ * the threat model that follows from it.
  *
  * Exception boundary — confinement, the root-destination refusal, the
  * symlink preflight and every Amp\File call an operation makes sit
- * inside that operation's own try, so a driver failure at any stage
- * arrives as the League type FilesystemOperator declares for that
- * operation.
+ * inside that operation's own try. A League\Flysystem\FilesystemException
+ * keeps its own type, so a policy outcome stays what it is; any other
+ * Exception becomes the UnableTo* type FilesystemOperator declares for
+ * the operation, with the original chained. An \Error is never caught,
+ * so a programmer error stays one.
  *
- * Which types a boundary has to name is decided by where amphp/file
- * stops translating, under the driver Amp\File\filesystem() actually
- * selects here: ParallelFilesystemDriver, chosen whenever neither
- * ext-uv nor ext-eio is loaded, which is this project's own
- * php:8.4-cli-alpine toolchain and every deployment that has not added
- * one of those extensions. That driver runs each path-level call
- * through runFileTask(), which turns a TaskFailureThrowable or a
- * WorkerException into Amp\File\FilesystemException, and ParallelFile
- * turns the same pair into Amp\ByteStream\StreamException for read(),
- * write(), truncate() and seek(). Two of its paths translate nothing:
- * openFile() acquires a worker from the pool before the try that wraps
- * the open task, so a pool or context failure surfaces raw, and
- * ParallelFile::close() submits its fclose task with no wrapping at
- * all. The four operations that open or close a handle — write(),
- * writeStream(), copy() and mimeType() — therefore name
- * Amp\Parallel\Worker\WorkerException,
- * Amp\Parallel\Worker\TaskFailureException and
- * Amp\Parallel\Context\ContextException alongside the two Amp\File
- * types; no other operation reaches either path.
- *
- * Nothing wider than that is caught, so a policy outcome keeps its own
- * identity all the way to the caller instead: a SymbolicLinkEncountered,
- * a PathTraversalDetected or CorruptedPathDetected from ConfinedPath,
- * an InvalidVisibilityProvided from a garbage visibility, an
- * IndeterminatePublicationException from a rename that cannot be
- * classified. A programmer error keeps its own identity too, which is
- * what leaves Amp\Parallel\Worker\TaskFailureError (an \Error, carrying
- * an \Error the task itself raised), Amp\File\PendingOperationError and
- * Amp\Parallel\Context\StatusError out of every list above.
- * {doc}`storage` carries the whole mapping, operation by operation;
- * each method below implements its own row of it.
- *
- * Cleanup never reports in place of the failure that prompted it:
- * closingAfter()/closeAll() absorb a close failure while a primary is
- * in flight, and deleteBestEffort()/deleteDirectoryBestEffort() absorb
- * every type. That holds for a worker or task failure the same as for
- * an Amp\File one, since those helpers catch Throwable rather than a
- * named list.
- *
- * Not a security boundary against a concurrent actor — stated plainly,
- * not as a footnote, because "Symlinks are never followed" is exactly
- * the kind of headline claim this limitation contradicts:
- *
- * - What the checks above catch: a symlink that already exists below
- *   $root at the moment a component is checked, however it got there
- *   (an unpacked archive containing one, a link left over from an
- *   earlier operation, one planted moments before this request and left
- *   in place). This is genuinely useful — it's the entire static-exploit
- *   case — but it is a check-then-use guard, not a race-free primitive.
- * - What they cannot catch, structurally, not as a matter of degree: a
- *   symlink swapped into place between a component's own isSymlink()
- *   check and the real filesystem operation that follows it a few
- *   instructions later. Checking a deeper component doesn't help —
- *   resolving root/swapped/child already follows whatever swapped has
- *   become by the time the real operation runs, regardless of what an
- *   earlier lstat() found; the check and the use are always two separate
- *   syscalls with an unavoidable gap between them. Closing this for real
- *   needs a directory-relative, no-follow open (openat()/O_NOFOLLOW,
- *   walked one component at a time from a held parent directory
- *   descriptor) — nothing in Amp\File, or PHP itself without a native
- *   extension binding that syscall, exposes one. ext-ffi was checked,
- *   not assumed absent, as a route to it directly: not compiled into
- *   this project's own standard `php:8.4-cli-alpine` toolchain image,
- *   and even where available, a native extension dependency to reach one
- *   syscall is a heavier, more fragile commitment than this closes.
- *   Not pursued.
- * - The supported threat model, narrowed accordingly rather than
- *   left open-ended: $root is a real boundary only when this adapter is
- *   the sole writer to it — an application-exclusive directory nothing
- *   else, trusted or not, creates, renames, or replaces entries in
- *   concurrently. Outside that model — shared storage, a process
- *   unpacking untrusted uploads directly into $root, any other actor
- *   with concurrent write access to the tree — these checks provide no
- *   protection at all, not merely weaker protection, since winning the
- *   race needs nothing beyond ordinary filesystem access to $root, not
- *   an already-compromised environment. A deployment that can't
- *   guarantee application-exclusive access needs an OS-level control
- *   this adapter cannot provide from PHP userland instead: Linux's
- *   `nosymfollow` mount option (5.10+), a dedicated bind-mount/mount
- *   namespace with no symlink-creation rights for any other writer, or
- *   restricting symlink() for every other writer via seccomp/an LSM
- *   profile.
- *
- * copy()'s post-copy source check carries the identical check-then-use
- * structure, for the identical reason — see sourceStillMatches() for
- * what it verifies and what it cannot.
- *
- * write(), writeStream() and copy() publish through one primitive,
- * publishThroughStagingDirectory(). {doc}`storage`'s "Writes are staged
- * privately and published atomically" section is the contract: the
- * privacy boundary and its same-UID limitation, what a failed call
- * guarantees, what it can leave behind, and the three outcomes of a
- * rename that fails without saying whether it happened.
- *
- * See {doc}`storage`.
+ * write(), writeStream() and copy() publish through publish(), which
+ * builds the new content in a private directory beside the destination
+ * and renames it into place. See {doc}`storage`.
  */
 final readonly class AmpFileAdapter implements FilesystemAdapter
 {
     private const int MIME_TYPE_SAMPLE_BYTES = 4096;
 
     /**
-     * The POSIX S_IFMT mask, isolating a stat mode's file-type bits
-     * (regular file/directory/symlink/etc.) from its permission bits —
-     * a stable, portable value across every real Unix stat(2)
-     * implementation. Amp\File\Filesystem::getStatus() reports a plain
-     * file as 0100644, a directory as 0040755, and a symlink as the mode
-     * of whatever it points to, since it follows symlinks;
-     * getLinkStatus() is the lstat()-equivalent that does not. Used by
-     * sourceUnchanged() below.
-     */
-    private const int TYPE_MASK = 0170000;
-
-    /**
      * The mode every staging directory is created with, closing it to
      * every user but the one this process runs as. mkdir(2) applies the
      * umask to its argument and a umask only clears bits, so the
-     * directory is never broader than this and needs no chmod afterward.
-     * {doc}`storage` states what this boundary does and does not cover.
+     * directory is never broader than this and needs no chmod
+     * afterward. It is what makes a staged file private from creation:
+     * Amp\File\Filesystem::openFile() takes no mode, and the umask is
+     * process-global and cannot be changed safely from a worker thread.
      */
     private const int STAGING_DIRECTORY_MODE = 0700;
 
     /**
-     * The mode a staged file is moved to while it is still empty, and
-     * keeps until the instant before it is renamed into place — a second
-     * layer under the directory's own, so a staged file is private on
-     * its own terms.
-     */
-    private const int STAGED_FILE_MODE = 0600;
-
-    /**
-     * The single entry a staging directory ever holds. Fixed rather than
-     * random: the directory's own name already carries the per-call
-     * randomness.
+     * The single entry a staging directory ever holds. Fixed rather
+     * than random: the directory's own name already carries the
+     * per-call randomness.
      */
     private const string STAGED_FILE_NAME = 'staged';
 
     /**
-     * The reason every publication refuses a destination that names
-     * $root itself — see this class's own docblock for what such a
-     * destination would otherwise do. Written once and carried into
-     * each operation's own League exception, so the four refusals
-     * cannot drift apart.
+     * How much writeStream() reads from the caller's resource, and
+     * copy() from the source handle, per chunk. Each chunk is one
+     * driver write — and, for copy(), one driver read as well — which
+     * under the worker-pool driver is an IPC round trip apiece, so the
+     * 8 KiB Amp\ByteStream defaults to would cost thousands of them for
+     * an ordinary upload.
+     */
+    private const int STREAM_CHUNK_BYTES = 524288;
+
+    /**
+     * Written once and carried into each operation's own League
+     * exception, so the four refusals cannot drift apart.
      */
     private const string ROOT_DESTINATION_REASON = 'the destination names the storage root itself';
 
@@ -272,13 +143,12 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     /**
      * $root with any trailing separator stripped — the prefix every
      * location is built on and the point every symlink check walks down
-     * from. Never itself checked: it's operator-configured
-     * (FILESYSTEM_ROOT), not attacker-reachable, the same trust boundary
-     * every other configuration value in this framework already has.
+     * from. Never itself checked: it is operator-configured
+     * (FILESYSTEM_ROOT), the same trust boundary every other
+     * configuration value in this framework has.
      *
      * A root of '/' strips to the empty string here, which is why
-     * locate() reads $rootLocation rather than this for the empty
-     * logical path.
+     * locate() reads $rootLocation for the empty logical path.
      */
     private string $root;
 
@@ -289,9 +159,7 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     private string $rootLocation;
 
     /**
-     * @throws InvalidArgumentException when $root is empty — see this
-     *   class's own docblock for why an empty root is refused rather
-     *   than resolved against the process working directory
+     * @throws InvalidArgumentException when $root is empty
      */
     public function __construct(
         private Filesystem $filesystem,
@@ -318,6 +186,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
             return $this->firstSymlinkBelowRoot($confined) === null
                 && $this->filesystem->isFile($this->locate($confined));
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToCheckFileExistence::forLocation($path, $e);
         }
     }
@@ -331,6 +201,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
             return $this->firstSymlinkBelowRoot($confined) === null
                 && $this->filesystem->isDirectory($this->locate($confined));
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToCheckDirectoryExistence::forLocation($path, $e);
         }
     }
@@ -339,77 +211,94 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     public function write(string $path, string $contents, Config $config): void
     {
         try {
-            $location = $this->publicationLocation(
-                $path,
-                static fn (): UnableToWriteFile => UnableToWriteFile::atLocation($path, self::ROOT_DESTINATION_REASON),
-            );
+            $location = $this->publicationLocation($path);
 
-            // Resolved — and, for a garbage value, thrown — before
-            // anything on disk is touched. See resolveExplicitFileMode()'s
-            // own docblock.
-            $mode = $this->resolveExplicitFileMode($config);
+            if ($location === null) {
+                throw UnableToWriteFile::atLocation($path, self::ROOT_DESTINATION_REASON);
+            }
 
-            $this->publishThroughStagingDirectory(
-                $path,
-                $location,
-                $mode,
-                $config,
-                static function (File $staged) use ($contents): int {
-                    $staged->write($contents);
+            // Converted before anything on disk is touched:
+            // forFile() is a pure string-to-int mapping, so a garbage
+            // visibility raises InvalidVisibilityProvided with no
+            // staging directory created and no parent built for a call
+            // that was never going to publish.
+            $mode = $this->explicitFileMode($config);
 
-                    // The whole body in one call, so the count checked
-                    // against the staged length is its own length.
-                    return \strlen($contents);
-                },
-            );
-        } catch (FilesystemException|StreamException|WorkerException|TaskFailureException|ContextException $e) {
-            throw UnableToWriteFile::atLocation($path, $e->getMessage(), $e);
-        }
-    }
+            $this->publish($location, $mode, $config, static function (File $staged) use ($contents): int {
+                $staged->write($contents);
 
-    #[\Override]
-    public function writeStream(string $path, $contents, Config $config): void
-    {
-        try {
-            // Ahead of the ReadableResourceStream below, so a refused
-            // destination leaves the caller's own resource untouched at
-            // the position they handed it over at.
-            $location = $this->publicationLocation(
-                $path,
-                static fn (): UnableToWriteFile => UnableToWriteFile::atLocation($path, self::ROOT_DESTINATION_REASON),
-            );
-            $mode = $this->resolveExplicitFileMode($config);
-
-            $this->publishThroughStagingDirectory(
-                $path,
-                $location,
-                $mode,
-                $config,
-                static function (File $staged) use ($contents): int {
-                    // pipe() counts what it hands over chunk by chunk,
-                    // so the delivered count needs no copy of the body.
-                    return pipe(new ReadableResourceStream($contents), $staged);
-                },
-            );
-        } catch (FilesystemException|StreamException|WorkerException|TaskFailureException|ContextException $e) {
+                // The whole body in one call, so the count checked
+                // against the staged length is its own length.
+                return \strlen($contents);
+            });
+        } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToWriteFile::atLocation($path, $e->getMessage(), $e);
         }
     }
 
     /**
-     * Resolves the concrete file mode an explicit visibility maps to,
-     * before write()/writeStream() reach the filesystem at all.
-     * VisibilityConverter::forFile() is a pure, side-effect-free
-     * string-to-int mapping, so calling it here means a garbage
-     * explicit value's InvalidVisibilityProvided escapes with nothing on
-     * disk touched — no staging directory created, no parent directory
-     * built for a call that was never going to publish anything.
-     * Returns null when no visibility was requested, which
-     * publishThroughStagingDirectory() reads as "publish at the mode
-     * this path would have had anyway" rather than as a mode of its
-     * own.
+     * $contents is the caller's resource: never closed here, and left
+     * at whatever blocking mode it arrived with.
+     * Amp\ByteStream\ReadableResourceStream switches it to non-blocking
+     * to install its readability watcher, so the mode is captured
+     * before and restored after.
      */
-    private function resolveExplicitFileMode(Config $config): ?int
+    #[\Override]
+    public function writeStream(string $path, $contents, Config $config): void
+    {
+        $blocking = null;
+
+        try {
+            // Ahead of the ReadableResourceStream below, so a refused
+            // destination leaves the caller's own resource untouched at
+            // the position they handed it over at.
+            $location = $this->publicationLocation($path);
+
+            if ($location === null) {
+                throw UnableToWriteFile::atLocation($path, self::ROOT_DESTINATION_REASON);
+            }
+
+            $mode = $this->explicitFileMode($config);
+            $blocking = self::blockingModeOf($contents);
+
+            $this->publish($location, $mode, $config, static function (File $staged) use ($contents): int {
+                // pipe() counts what it hands over chunk by chunk, so
+                // the delivered count needs no copy of the body.
+                return pipe(new ReadableResourceStream($contents, self::STREAM_CHUNK_BYTES), $staged);
+            });
+        } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
+            throw UnableToWriteFile::atLocation($path, $e->getMessage(), $e);
+        } finally {
+            if ($blocking !== null && \is_resource($contents)) {
+                \stream_set_blocking($contents, $blocking);
+            }
+        }
+    }
+
+    /**
+     * The caller's resource's current blocking mode, or null when the
+     * stream does not report one — a wrapper is free to omit the key,
+     * and a mode that was never observed is not one to restore.
+     *
+     * @param resource $contents
+     */
+    private static function blockingModeOf($contents): ?bool
+    {
+        $blocked = \stream_get_meta_data($contents)['blocked'] ?? null;
+
+        return \is_bool($blocked) ? $blocked : null;
+    }
+
+    /**
+     * The concrete mode an explicit visibility maps to, or null when
+     * the call requested none — which publish() reads as "publish at
+     * the mode this path would have had anyway".
+     */
+    private function explicitFileMode(Config $config): ?int
     {
         $visibility = $config->get(Config::OPTION_VISIBILITY);
 
@@ -422,102 +311,58 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         try {
             return $this->filesystem->read($this->confinedLocation($path));
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToReadFile::fromLocation($path, $e->getMessage(), $e);
         }
     }
 
+    /**
+     * Reads the whole object through read() above and hands it back as
+     * a `php://temp` resource. `php://temp` keeps up to 2 MiB in memory
+     * and spills the rest to a temporary file, so memory and disk cost
+     * the object's own size and the spill blocks this thread for as
+     * long as that disk takes. Prefer read() unless a consumer requires
+     * a resource.
+     *
+     * The three native calls sit inside one boundary of their own,
+     * because a failure they report as a warning — a full or unwritable
+     * spill disk, most of all — becomes a throw under an application
+     * error handler that converts warnings. That throw would otherwise
+     * leave this method as something other than the UnableToReadFile
+     * its interface declares, with the temporary resource still open.
+     * A League exception and an \Error each keep their own type, the
+     * same as every other operation here.
+     */
     #[\Override]
     public function readStream(string $path)
     {
         $contents = $this->read($path);
-
-        \error_clear_last();
-        $stream = @\fopen('php://temp', 'r+b');
-
-        if ($stream === false) {
-            throw UnableToReadFile::fromLocation($path, $this->describeLastWarning('unable to open a temporary stream'));
-        }
+        $stream = null;
 
         try {
-            $this->populateTempStream($stream, $path, $contents);
-        } catch (UnableToReadFile $e) {
-            \fclose($stream);
+            $stream = @\fopen('php://temp', 'r+b');
+
+            if ($stream === false) {
+                throw UnableToReadFile::fromLocation($path, 'unable to open a temporary stream');
+            }
+
+            if (@\fwrite($stream, $contents) !== \strlen($contents) || \rewind($stream) === false) {
+                throw UnableToReadFile::fromLocation($path, 'unable to buffer the file into a temporary stream');
+            }
+
+            return $stream;
+        } catch (Throwable $e) {
+            if (\is_resource($stream)) {
+                \fclose($stream);
+            }
+
+            if ($e instanceof Exception && !$e instanceof FilesystemException) {
+                throw UnableToReadFile::fromLocation($path, $e->getMessage(), $e);
+            }
 
             throw $e;
         }
-
-        return $stream;
-    }
-
-    /**
-     * Writes $contents to $stream in a progress-checked loop, then
-     * rewinds it to byte zero — construction/population/rewind of the
-     * temporary stream readStream() hands back are all treated as part
-     * of the read operation, so a failure at any of these stages
-     * surfaces as UnableToReadFile for $path, never a bare PHP warning
-     * as the only signal (every native call here is @-suppressed, with
-     * the real warning text captured via describeLastWarning() instead
-     * of discarded).
-     *
-     * fwrite() is not guaranteed to consume its entire argument in one
-     * call — PHP's own streams layer retries a short stream_write()
-     * automatically, but only up to the first zero-progress attempt;
-     * confirmed directly, not assumed, since a userspace stream wrapper
-     * can force exactly that combination deterministically. A single
-     * unchecked fwrite() can therefore silently truncate $contents at
-     * whatever a caller's resource happened to accept in one attempt.
-     * false or zero progress on any individual call here is treated as
-     * a hard failure; a lesser positive count just continues the loop.
-     *
-     * $stream is left open at whatever position a failure occurred —
-     * this method only ever throws, never closes it; readStream() is
-     * the one responsible for closing it, since only readStream() knows
-     * whether $stream is one it opened itself versus one a caller
-     * handed in some other way.
-     *
-     * A resource parameter rather than the URL to open, deliberately:
-     * this is the seam a test uses to force a deterministic fwrite()/
-     * rewind() failure via a real, custom stream wrapper, without
-     * needing to exhaust a real resource (memory, disk, file
-     * descriptors) to trigger one.
-     *
-     * @param resource $stream
-     */
-    private function populateTempStream($stream, string $path, string $contents): void
-    {
-        $length = \strlen($contents);
-        $written = 0;
-
-        while ($written < $length) {
-            \error_clear_last();
-            $result = @\fwrite($stream, \substr($contents, $written));
-
-            if ($result === false || $result === 0) {
-                throw UnableToReadFile::fromLocation($path, $this->describeLastWarning('unable to write to the temporary stream'));
-            }
-
-            $written += $result;
-        }
-
-        \error_clear_last();
-
-        if (@\rewind($stream) === false) {
-            throw UnableToReadFile::fromLocation($path, $this->describeLastWarning('unable to rewind the temporary stream'));
-        }
-    }
-
-    /**
-     * The real PHP warning message for the @-suppressed call
-     * immediately before this, when one fired — genuinely more useful
-     * than a fixed string for whoever debugs a real failure — or
-     * $fallback when none did (a controlled test double, for instance,
-     * can fail without ever triggering a native warning at all).
-     */
-    private function describeLastWarning(string $fallback): string
-    {
-        $error = \error_get_last();
-
-        return $error !== null ? $error['message'] : $fallback;
     }
 
     #[\Override]
@@ -526,16 +371,17 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         try {
             $this->filesystem->deleteFile($this->confinedLocation($path));
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToDeleteFile::atLocation($path, $e->getMessage(), $e);
         }
     }
 
     /**
-     * A symlink found anywhere in the tree leaves the whole call as a
-     * no-op and keeps its own type: SymbolicLinkEncountered is a policy
-     * outcome, not an Amp\File failure, so the catch below never sees
-     * it. See deleteDirectoryRecursively() for what an I/O failure
-     * partway through the deletion pass leaves instead.
+     * A symlink found anywhere in the tree leaves the whole call a
+     * no-op and keeps its own type. See deleteDirectoryRecursively()
+     * for what an I/O failure partway through the deletion pass leaves
+     * instead.
      */
     #[\Override]
     public function deleteDirectory(string $path): void
@@ -546,6 +392,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
 
             $this->deleteDirectoryRecursively($this->locate($confined), $confined->path);
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToDeleteDirectory::atLocation($path, $e->getMessage(), $e);
         }
     }
@@ -556,9 +404,11 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         try {
             $this->filesystem->createDirectoryRecursively(
                 $this->confinedLocation($path),
-                $this->explicitDirectoryModeFor($config),
+                $this->explicitDirectoryMode($config),
             );
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToCreateDirectory::atLocation($path, $e->getMessage(), $e);
         }
     }
@@ -573,19 +423,17 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
                 : $this->visibility->forFile($visibility);
             $this->filesystem->changePermissions($location, $mode);
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToSetVisibility::atLocation($path, $e->getMessage(), $e);
         }
     }
 
     /**
-     * File-only by contract, not merely by this class's own choice —
+     * File-only by contract, not by this class's choice —
      * League\Flysystem\FilesystemAdapter::visibility() is declared to
-     * return FileAttributes specifically, never DirectoryAttributes, and
-     * League\Flysystem\Local\LocalFilesystemAdapter (Flysystem's own
-     * reference local adapter) implements this identically: always
-     * inverseForFile(), unconditionally, with no directory branch at
-     * all. Nothing upstream ever calls this with a directory path
-     * expecting directory-visibility semantics back.
+     * return FileAttributes, and Flysystem's own local adapter
+     * implements this identically, with no directory branch at all.
      */
     #[\Override]
     public function visibility(string $path): FileAttributes
@@ -593,6 +441,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         try {
             $status = $this->filesystem->getStatus($this->confinedLocation($path));
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToRetrieveMetadata::visibility($path, $e->getMessage(), $e);
         }
 
@@ -608,7 +458,9 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     {
         try {
             $sample = $this->readMimeTypeSample($this->confinedLocation($path));
-        } catch (FilesystemException|StreamException|WorkerException|TaskFailureException|ContextException $e) {
+        } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToRetrieveMetadata::mimeType($path, $e->getMessage(), $e);
         }
 
@@ -621,29 +473,20 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         return new FileAttributes($path, mimeType: $mimeType);
     }
 
-    /**
-     * Reads up to MIME_TYPE_SAMPLE_BYTES from $location for mimeType()'s
-     * own detection, through the same closingAfter() the publication
-     * path uses: a close() failure while a read failure is already
-     * propagating is absorbed, and one with nothing already failing is
-     * the failure. That is what keeps the read failure the one
-     * UnableToRetrieveMetadata::mimeType() reports as its own reason and
-     * previous, rather than a close failure with the read failure buried
-     * one level deeper.
-     *
-     * Opening the handle sits outside that, so mimeType()'s own boundary
-     * is what reports a failure there — including the worker
-     * acquisition ParallelFilesystemDriver::openFile() performs before
-     * it has an open task to wrap a failure in.
-     */
     private function readMimeTypeSample(string $location): string
     {
         $handle = $this->filesystem->openFile($location, 'r');
+        $failure = null;
 
-        return self::closingAfter(
-            [$handle],
-            static fn (): string => $handle->read(length: self::MIME_TYPE_SAMPLE_BYTES) ?? '',
-        );
+        try {
+            return $handle->read(length: self::MIME_TYPE_SAMPLE_BYTES) ?? '';
+        } catch (Throwable $e) {
+            $failure = $e;
+
+            throw $e;
+        } finally {
+            self::closeHandle($handle, $failure);
+        }
     }
 
     #[\Override]
@@ -652,6 +495,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         try {
             $time = $this->filesystem->getModificationTime($this->confinedLocation($path));
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToRetrieveMetadata::lastModified($path, $e->getMessage(), $e);
         }
 
@@ -664,6 +509,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         try {
             $size = $this->filesystem->getSize($this->confinedLocation($path));
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToRetrieveMetadata::fileSize($path, $e->getMessage(), $e);
         }
 
@@ -672,18 +519,15 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
 
     /**
      * A generator, so nothing here runs until the caller iterates —
-     * which is why the boundary is inside the method body rather than
-     * around a call to it. The try covers the whole walk, so a driver
+     * which is why the boundary is inside the method body. A driver
      * failure on the tenth directory reaches the caller as
      * UnableToListContents just as one on the first does.
      *
-     * A symlink discovered mid-walk keeps its own type here:
-     * SymbolicLinkEncountered, naming the entry. Behind a
+     * A symlink discovered mid-walk keeps its own type here. Behind a
      * League\Flysystem\FilesystemOperator the same walk arrives as
      * UnableToListContents with that SymbolicLinkEncountered as its
      * previous, since Filesystem::listContents() wraps every Throwable
-     * its own iteration sees. {doc}`storage` states which of the two a
-     * caller catches.
+     * its own iteration sees.
      *
      * @return iterable<StorageAttributes>
      */
@@ -701,6 +545,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
 
             yield from $this->listContentsRecursively($location, $confined->path, $deep);
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToListContents::atLocation($path, $deep, $e);
         }
     }
@@ -712,41 +558,31 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
      * The order is what the guarantees rest on. The source's kind is
      * read, and an explicit visibility converted, before a parent
      * directory is created or anything is renamed: after the rename the
-     * source is gone, and a directory built for a call that turns out to
-     * carry a garbage visibility is a mutation for an operation that
-     * publishes nothing. An InvalidVisibilityProvided therefore leaves
-     * the tree exactly as it found it, and escapes as itself —
-     * League\Flysystem\Local\LocalFilesystemAdapter's own move() does
-     * not relabel it either.
+     * source is gone, and a directory built for a call carrying a
+     * garbage visibility is a mutation for an operation that publishes
+     * nothing. An InvalidVisibilityProvided therefore leaves the tree
+     * exactly as it found it and escapes as itself.
      *
      * A rename keeps the same inode, so the destination already carries
      * the source's own mode and a call requesting no visibility applies
-     * none. An explicit one goes through the converter the source's kind
-     * calls for: forDirectory() for a directory, forFile() for anything
-     * else, so moving a directory private does not land it on a file's
-     * 0600 with its own contents unreachable.
+     * none. An explicit one goes through the converter the source's
+     * kind calls for, so moving a directory private does not land it on
+     * a file's 0600 with its own contents unreachable.
      *
      * $to is never rolled back on a failure after the rename: it is by
-     * then the only remaining copy of the data, so removing it would
-     * trade a wrong mode for real data loss. copy() carries no such
-     * constraint — it builds its result inside a staging directory and
-     * never touches $to until that result is complete.
+     * then the only remaining copy of the data.
      */
     #[\Override]
     public function move(string $source, string $destination, Config $config): void
     {
         try {
-            [$from, $to] = $this->confinedLocationPair(
-                $source,
-                $destination,
-                static fn (): UnableToMoveFile => UnableToMoveFile::because(
-                    self::ROOT_DESTINATION_REASON,
-                    $source,
-                    $destination,
-                ),
-            );
+            [$from, $to] = $this->confinedLocationPair($source, $destination);
 
-            $mode = $this->resolveExplicitMoveMode($config, $this->filesystem->isDirectory($from));
+            if ($to === null) {
+                throw UnableToMoveFile::because(self::ROOT_DESTINATION_REASON, $source, $destination);
+            }
+
+            $mode = $this->explicitMoveMode($config, $this->filesystem->isDirectory($from));
 
             $this->ensureParentDirectoryExists($to, $config);
             $this->filesystem->move($from, $to);
@@ -755,6 +591,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
                 $this->filesystem->changePermissions($to, $mode);
             }
         } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
         }
     }
@@ -763,10 +601,10 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
      * The mode move() applies after the rename, or null when the call
      * requested no visibility. Pure: the converters map a string to an
      * int and touch nothing, so a garbage value throws
-     * League\Flysystem\InvalidVisibilityProvided while the tree is still
-     * untouched.
+     * League\Flysystem\InvalidVisibilityProvided while the tree is
+     * still untouched.
      */
-    private function resolveExplicitMoveMode(Config $config, bool $sourceIsDirectory): ?int
+    private function explicitMoveMode(Config $config, bool $sourceIsDirectory): ?int
     {
         $visibility = $config->get(Config::OPTION_VISIBILITY);
 
@@ -782,253 +620,191 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     /**
      * Streams $source into a staged file inside a private directory
      * beside the destination and renames it over $to only once the
-     * whole copy has succeeded — see publishThroughStagingDirectory()
-     * for the publication guarantee and the failure guarantee, which
-     * copy() shares with write() and writeStream() rather than
-     * restating.
+     * whole copy has succeeded — publish() holds the publication and
+     * failure guarantees copy() shares with write() and writeStream().
      *
-     * What is copy()'s own: the retained mode is read from $from before
-     * the source handle is opened, and $from is read again after the
-     * byte copy. A disagreement between the two readings fails the copy
-     * with UnableToRetrieveMetadata as the cause, before anything is
-     * published. sourceStillMatches() states what that pair does and
-     * does not detect.
+     * What the destination is published at: an explicit visibility
+     * first, then the source's own visibility when `retain_visibility`
+     * is left at its default. A retained mode is read from the source
+     * pathname before the read handle is opened, so the pathname is
+     * read again once it is — see assertSourceUnchanged().
      */
     #[\Override]
     public function copy(string $source, string $destination, Config $config): void
     {
         try {
-            [$from, $to] = $this->confinedLocationPair(
-                $source,
-                $destination,
-                static fn (): UnableToCopyFile => UnableToCopyFile::because(
-                    self::ROOT_DESTINATION_REASON,
-                    $source,
-                    $destination,
-                ),
-            );
+            [$from, $to] = $this->confinedLocationPair($source, $destination);
 
-            $explicitVisibility = $config->get(Config::OPTION_VISIBILITY);
-            $retainVisibility = (bool) $config->get(Config::OPTION_RETAIN_VISIBILITY, true);
+            if ($to === null) {
+                throw UnableToCopyFile::because(self::ROOT_DESTINATION_REASON, $source, $destination);
+            }
 
-            // forFile() is a pure string-to-int mapping, so a garbage
-            // explicit visibility raises InvalidVisibilityProvided with
-            // nothing on disk touched yet. It escapes as itself rather
-            // than being relabeled as an UnableToCopyFile it isn't.
-            $explicitMode = $explicitVisibility !== null
-                ? $this->visibility->forFile((string) $explicitVisibility)
-                : null;
+            $mode = $this->explicitFileMode($config);
 
             // Filesystem::copy()'s default identical-path resolution
             // (ResolveIdenticalPathConflict::TRY) delegates all the way
-            // here; FAIL and IGNORE are resolved by the Filesystem facade
-            // and never reach this adapter. $to is $from, so there is no
-            // second file to produce and nothing to replace — only an
-            // explicit override touches the file. See
-            // reapplySameOriginVisibility().
+            // here; FAIL and IGNORE are resolved by the Filesystem
+            // facade and never reach this adapter. $to is $from, so
+            // there is no second file to produce and nothing to
+            // replace: only an explicit override touches the file, and
+            // it is never deleted on a failure, being the only
+            // remaining copy of the data. Reading the mode back and
+            // reapplying it, the way genuine retention does, would
+            // canonicalize a real but non-canonical mode into a
+            // broader one with no request to do so.
             if ($from === $to) {
-                $this->reapplySameOriginVisibility($to, $explicitMode);
+                if ($mode !== null) {
+                    $this->filesystem->changePermissions($to, $mode);
+                }
 
                 return;
             }
 
-            // Observed before the source handle is opened, whatever the
-            // destination's mode is going to come from. Observed after
-            // the open instead, a source replaced in between would be
-            // described by both observations while the handle still
-            // streams the file that was there first, and the check after
-            // the copy would agree with itself.
-            $beforeStatus = $this->filesystem->getLinkStatus($from);
-            $mode = $this->resolveCopyMode($source, $explicitMode, $retainVisibility, $beforeStatus);
+            // Null for a copy whose mode came from somewhere other than
+            // the source: nothing was read off the source pathname, so
+            // there is nothing about it to re-establish either.
+            $sourceStatus = null;
 
-            $this->publishThroughStagingDirectory(
-                $destination,
-                $to,
-                $mode,
-                $config,
-                function (File $staged) use ($from, $source, $beforeStatus): int {
-                    // The source handle is this closure's to close; the
-                    // staged one belongs to the primitive.
-                    $readHandle = $this->filesystem->openFile($from, 'r');
+            if ($mode === null && (bool) $config->get(Config::OPTION_RETAIN_VISIBILITY, true)) {
+                $sourceStatus = $this->filesystem->getLinkStatus($from);
+                $mode = $this->retainedMode($sourceStatus, $source, $destination);
+            }
 
-                    return self::closingAfter([$readHandle], function () use ($staged, $readHandle, $from, $source, $beforeStatus): int {
-                        $copied = pipe($readHandle, $staged);
+            $this->publish($to, $mode, $config, function (File $staged) use ($from, $source, $destination, $sourceStatus): int {
+                // The source handle is this closure's to close; the
+                // staged one belongs to publish().
+                $readHandle = $this->filesystem->openFile($from, 'r');
+                $failure = null;
 
-                        // Checked before the commit, so a source that
-                        // changed under the copy publishes nothing
-                        // rather than one file's bytes as another's.
-                        if (!$this->sourceStillMatches($from, $beforeStatus)) {
-                            throw UnableToRetrieveMetadata::create($source, 'identity', 'the source changed while it was being copied');
-                        }
+                try {
+                    if ($sourceStatus !== null) {
+                        $this->assertSourceUnchanged($from, $sourceStatus, $source, $destination);
+                    }
 
-                        return $copied;
-                    });
-                },
-            );
-        } catch (FilesystemException|StreamException|WorkerException|TaskFailureException|ContextException|UnableToRetrieveMetadata $e) {
+                    return self::transfer($readHandle, $staged);
+                } catch (Throwable $e) {
+                    $failure = $e;
+
+                    throw $e;
+                } finally {
+                    self::closeHandle($readHandle, $failure);
+                }
+            });
+        } catch (FilesystemException $e) {
+            throw $e;
+        } catch (Exception $e) {
             throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
         }
     }
 
     /**
-     * Re-reads $from after the byte copy and reports whether it still
-     * describes the file the copy started from — same type, same
-     * permission bits, same device and inode. Run for every copy, not
-     * only for one retaining the source's visibility, so a source
-     * replaced under an explicit-mode copy is rejected too.
+     * The mode a retaining copy publishes: the source's own visibility,
+     * round-tripped through the converter so the destination lands on
+     * the canonical mode for that visibility — the same value
+     * setVisibility() would produce — rather than an arbitrary source
+     * mode this adapter never promises to reproduce.
      *
-     * Both observations go through getLinkStatus(): lstat semantics, so
-     * a symlink swapped into $from's place reads as a file-type change
-     * rather than being followed, and, under Amp\File's default driver
-     * composition, the uncached path. StatusCachingFilesystemDriver
-     * caches a getStatus() result per path for 1000 seconds and
-     * invalidates an entry only when this same process mutates that
-     * path, so a second getStatus() would usually replay the first
-     * observation verbatim.
+     * A source whose mode the filesystem cannot report fails the copy.
+     * Mode 0 is what a missing field would otherwise read as, and
+     * inverseForFile() maps it to Visibility::PUBLIC, so unknown is
+     * never allowed to become public.
      *
-     * What this pair does not catch, and no reading of a path can: a
-     * file mutated in place, or replaced and then reverted, between the
-     * two observations — the path's identity is unchanged because the
-     * inode is the same one, or is the same one again. Amp\File\File
-     * exposes no fstat-on-handle (getMode() returns the open mode,
-     * 'r'/'w', never permission bits), so neither observation is bound
-     * to the inode the read handle actually streamed. Same check-then-use
-     * structure, same missing kernel primitive, as this class's symlink
-     * checks: it narrows the window, it does not make copy() atomic.
-     *
-     * @param array<string, mixed>|null $before
+     * @param array<string, mixed>|null $status the source's status, as
+     *   read from its pathname before the read handle is opened
      */
-    private function sourceStillMatches(string $from, ?array $before): bool
+    private function retainedMode(?array $status, string $source, string $destination): int
     {
-        return $before !== null && self::sourceUnchanged($before, $this->filesystem->getLinkStatus($from));
+        $mode = $status['mode'] ?? null;
+
+        if (!\is_int($mode)) {
+            throw UnableToCopyFile::because('the source visibility could not be read', $source, $destination);
+        }
+
+        return $this->visibility->forFile($this->visibility->inverseForFile($mode & 0777));
     }
 
     /**
-     * True only when both $before and $after report the identical,
-     * known file type, permission bits and stable identity — the pure
-     * comparison sourceStillMatches() defers to, kept filesystem-free
-     * so it is directly testable with fabricated status arrays rather
-     * than needing a real race to exercise. Type and permission are two
-     * separate comparisons rather than one combined bitmask, so a path
-     * that became a directory or a symlink between the two stats while
-     * coincidentally sharing the original file's low 9 permission bits
-     * counts as changed rather than being masked away by an `& 0777`
-     * comparison alone. $after being null (the path no longer
-     * resolves), or either side missing a mode or reporting a non-int
-     * one, all count as changed too — unknown is never treated as
-     * unchanged.
+     * Fails a retaining copy unless $from still names the file $before
+     * described — same mode, including its file-type bits, and same
+     * device and inode. Called with the read handle already open, which
+     * is the boundary that matters: the mode the destination is going
+     * to be published at was read off the pathname, and between that
+     * reading and the open another writer can replace a public file
+     * with a private one, which would otherwise publish the second
+     * file's bytes at the first file's public mode.
+     *
+     * The open handle keeps reading the file it opened however the
+     * pathname changes afterward, so a replacement later in the copy
+     * cannot mix the two. It is not a snapshot of that file's contents:
+     * a writer modifying the same inode in place while the copy runs is
+     * read as it goes. Neither is this check a lock: a replacement
+     * reverted before the second reading passes it, and one landing
+     * between the open and that reading fails a copy the handle would
+     * have completed correctly. Amp\File\File exposes no stat on an open
+     * handle (getMode() reports 'r'/'w', never permission bits), so no
+     * reading available here is bound to the inode the handle holds.
+     * Same check-then-use structure, and same missing kernel primitive,
+     * as this class's symlink checks.
+     *
+     * @param array<string, mixed> $before
+     * @throws UnableToCopyFile when the pathname no longer describes
+     *   that file, or when either reading reports no usable identity —
+     *   unknown is never treated as unchanged
+     */
+    private function assertSourceUnchanged(string $from, array $before, string $source, string $destination): void
+    {
+        if (!self::sameFile($before, $this->filesystem->getLinkStatus($from))) {
+            throw UnableToCopyFile::because('the source was replaced while the copy was starting', $source, $destination);
+        }
+    }
+
+    /**
+     * Whether two readings of one pathname describe one file. Mode is
+     * compared whole rather than masked to 0777, so a path that became
+     * a directory or a symlink counts as changed even where the low
+     * nine bits happen to agree; device and inode are what tell one
+     * file from a different file created with the original's own mode.
+     * A field either side reports as anything but an int counts as
+     * changed.
      *
      * @param array<string, mixed> $before
      * @param array<string, mixed>|null $after
      */
-    private static function sourceUnchanged(array $before, ?array $after): bool
+    private static function sameFile(array $before, ?array $after): bool
     {
         if ($after === null) {
             return false;
         }
 
-        $beforeMode = $before['mode'] ?? null;
-        $afterMode = $after['mode'] ?? null;
+        foreach (['mode', 'dev', 'ino'] as $field) {
+            $value = $before[$field] ?? null;
 
-        if (!\is_int($beforeMode) || !\is_int($afterMode)) {
-            return false;
+            if (!\is_int($value) || $value !== ($after[$field] ?? null)) {
+                return false;
+            }
         }
 
-        if (($beforeMode & self::TYPE_MASK) !== ($afterMode & self::TYPE_MASK)) {
-            return false;
-        }
-
-        if (($beforeMode & 0777) !== ($afterMode & 0777)) {
-            return false;
-        }
-
-        // Device and inode are the only fields a stat offers that tell
-        // one file from a different file at the same path, which mode
-        // bits cannot: a replacement created with the original's own
-        // permissions matches on type and mode exactly. An identity
-        // neither observation supplies counts as changed — unknown is
-        // never treated as unchanged.
-        $beforeIdentity = self::identityOf($before);
-
-        return $beforeIdentity !== null && $beforeIdentity === self::identityOf($after);
+        return true;
     }
 
     /**
-     * copy()'s identical-source-and-destination branch. There is no
-     * separate destination here to retain anything *onto* — $to is
-     * $from — so retain_visibility (whether true or false) has nothing
-     * to do and is never consulted: only an explicit override touches
-     * the file's mode. Reading the file's own current mode back through
-     * inverseForFile() and reapplying it, the way the normal copy path
-     * does for genuine retention, would silently canonicalize a real
-     * but non-canonical mode (0640, say) to Visibility::PUBLIC's own
-     * 0644 the moment inverseForFile() fails to recognize it as one of
-     * the two values it knows — broadening a file's permissions with no
-     * explicit request to do so at all. Skipping the read-and-reapply
-     * entirely for the no-explicit-visibility case is what avoids that.
-     *
-     * A visibility failure here never deletes the file: $to *is* the
-     * source, the only existing copy of the data, so removing it on a
-     * permission-change failure would be real data loss — the same
-     * reasoning move()'s own docblock records. copy()'s own boundary
-     * turns that failure into UnableToCopyFile.
+     * Reads $source to its end and writes it to $staged, in chunks of
+     * self::STREAM_CHUNK_BYTES, returning the byte count handed over.
+     * Amp\ByteStream\pipe() would do the same at its own 8 KiB default
+     * read length, which under the worker-pool driver is a read and a
+     * write round trip per 8 KiB. Neither handle is closed here; each
+     * belongs to whoever opened it.
      */
-    private function reapplySameOriginVisibility(string $to, ?int $explicitMode): void
+    private static function transfer(File $source, File $staged): int
     {
-        if ($explicitMode !== null) {
-            $this->filesystem->changePermissions($to, $explicitMode);
-        }
-    }
+        $copied = 0;
 
-    /**
-     * Decides which mode (if any) copy() applies to the destination — a
-     * pure decision with no filesystem access of its own, kept separate
-     * from the stat call so the invariant that matters (unresolvable
-     * source metadata must never silently become Visibility::PUBLIC) is
-     * testable without a real filesystem.
-     *
-     * $sourceStatus is copy()'s pre-copy observation of the source,
-     * taken before the source handle is opened, so the mode this returns
-     * is decided from a reading nothing the copy itself does could have
-     * influenced. Whether that observation still describes the source
-     * afterward is sourceStillMatches()'s question, never this
-     * method's.
-     *
-     * @param array<string, mixed>|null $sourceStatus
-     * @throws UnableToRetrieveMetadata when retention is needed but
-     *   $sourceStatus is null, or its mode is missing or not an int.
-     *   Unknown metadata is a failure in each of those shapes, never
-     *   mode 0, which inverseForFile() would map to Visibility::PUBLIC
-     *   the same as a real 0644/0600 match. Nothing in the driver
-     *   contract guarantees an int mode, so it is checked rather than
-     *   assumed.
-     */
-    private function resolveCopyMode(
-        string $source,
-        ?int $explicitMode,
-        bool $retainVisibility,
-        ?array $sourceStatus,
-    ): ?int {
-        if ($explicitMode !== null) {
-            return $explicitMode;
+        while (($chunk = $source->read(length: self::STREAM_CHUNK_BYTES)) !== null) {
+            $staged->write($chunk);
+            $copied += \strlen($chunk);
         }
 
-        if (!$retainVisibility) {
-            return null;
-        }
-
-        $mode = $sourceStatus['mode'] ?? null;
-
-        if (!\is_int($mode)) {
-            throw UnableToRetrieveMetadata::visibility($source, 'source status could not be retrieved');
-        }
-
-        // Round-tripped through the converter rather than carried over
-        // raw, so the destination lands on the canonical mode for the
-        // source's own visibility — the same value setVisibility() would
-        // produce — not an arbitrary source mode this adapter never
-        // promises to reproduce.
-        return $this->visibility->forFile($this->visibility->inverseForFile($mode & 0777));
+        return $copied;
     }
 
     /**
@@ -1044,13 +820,11 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
             $entryLocation = $location . '/' . $name;
             $publicPath = $logical === '' ? $name : $logical . '/' . $name;
 
-            // $location itself was already established non-symlink by the
-            // caller (listContents()'s own check, or this same check one
-            // level up) — checking only the entry, not the whole path
-            // again, is what makes this cheap at any depth while still
-            // catching a symlink introduced anywhere in the tree, and
-            // never descending into or reporting on one, which is what
-            // also rules out a symlink cycle.
+            // $location itself was already established non-symlink by
+            // the caller — checking only the entry is what makes this
+            // cheap at any depth while still catching a symlink
+            // introduced anywhere in the tree, and never descending
+            // into or reporting on one, which also rules out a cycle.
             if ($this->filesystem->isSymlink($entryLocation)) {
                 throw SymbolicLinkEncountered::atLocation($publicPath);
             }
@@ -1078,27 +852,15 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
      * Deletion is split into two passes — plan, then execute — rather
      * than deleting each entry as the walk discovers it. A single
      * combined pass throws the moment it hits a symlink, but by then
-     * every safe sibling visited earlier in iteration order is already
-     * gone: "aborts entirely" would be false, since some of the tree was
-     * already deleted. Planning first (throwing on a symlink with
-     * nothing deleted yet, see planRecursiveDeletion()) is what makes a
-     * symlink anywhere in the tree a genuine no-op instead of a partial
-     * delete. This does widen the already-disclosed check-then-use race
-     * window slightly (the whole tree is walked before any deletion,
-     * rather than checking and deleting one entry at a time) — accepted,
-     * since that race is fundamentally open regardless (see this class's
-     * own "Threat model" docblock section) and a wider window there is a
-     * smaller cost than a deterministic, always-reproducible partial
-     * delete.
+     * every safe sibling visited earlier is already gone. Planning
+     * first is what makes a symlink anywhere in the tree a no-op rather
+     * than a partial delete.
      *
-     * A failure partway through the execute pass itself (deleteFile()/
-     * deleteDirectory() failing on a permission error, for one) is a
-     * different, unavoidable case this doesn't attempt to fix: nothing
-     * short of a real filesystem transaction could make an I/O failure
-     * mid-deletion atomic, so a caller catching an I/O-level
-     * FilesystemException here (as opposed to the symlink-policy
-     * SymbolicLinkEncountered above) should expect the tree to be
-     * partially deleted, not intact.
+     * A failure partway through the execute pass is a different case
+     * this does not attempt to fix: nothing short of a real filesystem
+     * transaction could make an I/O failure mid-deletion atomic, so a
+     * caller catching an I/O-level failure here should expect the tree
+     * to be partially deleted, not intact.
      */
     private function deleteDirectoryRecursively(string $location, string $logical): void
     {
@@ -1113,11 +875,9 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
         }
 
         // Deepest directories first — planRecursiveDeletion() appends a
-        // directory to its own list only after every one of its children
-        // (files and nested directories alike) has already been
-        // appended, so this order is already correct for deleteDirectory()
-        // to never be asked to remove a directory that still has
-        // anything left inside it.
+        // directory only after every one of its children, so this order
+        // never asks deleteDirectory() to remove a directory that still
+        // holds something.
         foreach ($plan['directories'] as $directory) {
             $this->filesystem->deleteDirectory($directory);
         }
@@ -1125,13 +885,9 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
 
     /**
      * Walks $location's whole subtree and returns every file and
-     * directory it contains, throwing SymbolicLinkEncountered the moment
+     * directory it holds, throwing SymbolicLinkEncountered the moment
      * any entry anywhere in it is a symlink — before anything has been
-     * deleted. $directories is ordered depth-first (a directory's own
-     * entry is appended only after all of its children), which is what
-     * lets deleteDirectoryRecursively() delete every returned directory
-     * in list order with no directory ever asked to be removed while
-     * something inside it still exists.
+     * deleted.
      *
      * @return array{files: list<string>, directories: list<string>}
      */
@@ -1144,11 +900,6 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
             $entryLocation = $location . '/' . $name;
             $publicPath = $logical === '' ? $name : $logical . '/' . $name;
 
-            // Same reasoning as listContentsRecursively()'s identical
-            // check: a symlink anywhere in the tree, whether it points to
-            // a file or a directory, stops the whole plan — never
-            // descended into or included, which is what also rules out a
-            // symlink cycle.
             if ($this->filesystem->isSymlink($entryLocation)) {
                 throw SymbolicLinkEncountered::atLocation($publicPath);
             }
@@ -1170,368 +921,138 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     /**
      * Builds $to's new content inside a private staging directory and
      * renames it into place — the single publication path write(),
-     * writeStream() and copy() share.
+     * writeStream() and copy() share. {doc}`storage` states the sequence
+     * and the guarantees that follow from it; two things hold it
+     * together here.
      *
-     * $fill receives an open handle on the staged file, writes the body
-     * into it, and returns the byte count it handed over. This method is
-     * the staged handle's sole normal owner and closes it; $fill must
-     * not. $fill owns only the handles it opens itself — copy()'s source
-     * handle, which it closes through closingAfter() — while write() and
-     * writeStream() open none and close nothing.
+     * The staging directory is a child of $to's own parent, so both
+     * paths are on one filesystem and the rename is the commit point.
+     * mkdir(2) creates it atomically, so anything already at that name
+     * fails the creation rather than being followed or reused.
      *
-     * The staged file is created inside a 0700 directory, moved to 0600
-     * while empty, checked for a stored length matching what was written
-     * to it, given the mode it is to be published under, and renamed
-     * over $to. The rename is the commit point, atomic because the
-     * staging directory is a child of $to's own parent and both paths
-     * are therefore on one filesystem.
+     * Every failure before that rename leaves $to as it was, since
+     * nothing before it touches $to at all. A failure reported *by* the
+     * rename says only that no acknowledgement of it came back: under
+     * the worker-pool driver the kernel rename can have committed and
+     * its reply been lost, so the operation's own UnableTo* exception
+     * leaves the publication outcome unknown rather than refuted.
+     * {doc}`storage` states what a caller can do about that.
      *
-     * {doc}`storage` states the privacy boundary, the publication
-     * guarantee and the three outcomes of a failed rename; this method
-     * implements them and does not restate them.
+     * $fill receives the open staged handle, writes the body into it,
+     * and returns the byte count it handed over. This method is that
+     * handle's sole owner and closes it; $fill must not. $fill owns
+     * only the handles it opens itself.
      *
      * @param ?int $mode the mode to publish with, or null for the mode
-     *   this path would have had anyway — see defaultPublicationModeFor()
+     *   this path would have had anyway — see publicationMode()
      * @param Closure(File): int $fill returns the byte count it wrote
-     * @throws IndeterminatePublicationException when a rename failure
-     *   cannot be classified
-     * @throws Throwable anything else the filesystem, $fill or the
-     *   rename raises — write(), writeStream() and copy() relabel the
-     *   types they name and let the rest reach the caller as itself
      */
-    private function publishThroughStagingDirectory(
-        string $path,
-        string $to,
-        ?int $mode,
-        Config $config,
-        Closure $fill,
-    ): void {
+    private function publish(string $to, ?int $mode, Config $config, Closure $fill): void
+    {
         $this->ensureParentDirectoryExists($to, $config);
 
-        $staging = $this->createStagingDirectory($to);
+        $staging = \dirname($to) . '/.kinetis-stage.' . \bin2hex(\random_bytes(16));
+        $this->filesystem->createDirectory($staging, self::STAGING_DIRECTORY_MODE);
         $staged = $staging . '/' . self::STAGED_FILE_NAME;
-
-        $handle = null;
-        $closed = false;
 
         try {
             $handle = $this->filesystem->openFile($staged, 'x');
 
-            // Read while the staged file still carries the mode its
-            // creation gave it, before the chmod below replaces that:
-            // that is the umask default for a new file here.
-            $publishedMode = $mode ?? $this->defaultPublicationModeFor($to, $staged);
+            try {
+                $written = $fill($handle);
+            } catch (Throwable $e) {
+                self::closeHandle($handle, $e);
 
-            $this->filesystem->changePermissions($staged, self::STAGED_FILE_MODE);
+                throw $e;
+            }
 
-            $written = $fill($handle);
+            // Closed before the length is read, or bytes still behind
+            // the handle would not be counted.
+            $handle->close();
 
-            // The staged handle is closed here and nowhere else on a
-            // path that reaches this line. Amp\Closable does not promise
-            // close() is idempotent, so a $fill that closed it too would
-            // make a conforming File that rejects a second close fail a
-            // write that had already succeeded. The close has to happen
-            // before the status read below, or that read could miss
-            // bytes still buffered behind the handle.
-            self::closeAll([$handle], null);
-            $closed = true;
+            $this->assertStagedLength($staged, $written);
 
-            $stagedIdentity = $this->verifiedStagedIdentity($staged, $written);
+            $published = $mode ?? $this->publicationMode($to);
 
-            $this->filesystem->changePermissions($staged, $publishedMode);
+            if ($published !== null) {
+                $this->filesystem->changePermissions($staged, $published);
+            }
+
+            $this->filesystem->move($staged, $to);
         } catch (Throwable $e) {
             // Throwable: a producer or a third-party Amp\File
             // implementation can raise anything, and an unfamiliar type
-            // must not be the one case that leaves a staged file behind.
-            // Rethrown unchanged, so a programming error stays one.
-            //
-            // Closed here only when the close above did not already
-            // succeed, so no path closes a handle twice except one whose
-            // own close failed — and the unlink below needs that attempt.
-            if ($handle !== null && !$closed && !$handle->isClosed()) {
-                self::closeAll([$handle], $e);
-            }
-
+            // must not be the one case that leaves a staged file
+            // behind. Rethrown unchanged, so a programmer error stays
+            // one, and both cleanups absorb every type so neither can
+            // report in place of the failure that prompted it.
             $this->deleteBestEffort($staged);
             $this->deleteDirectoryBestEffort($staging);
 
             throw $e;
         }
 
-        $this->commitStagedFile($path, $staged, $to, $staging, $stagedIdentity);
-    }
-
-    /**
-     * Renames the staged file over $to and cleans the staging directory
-     * up afterward.
-     *
-     * A rename failure does not by itself say whether the rename
-     * happened: a driver running rename(2) in a worker can lose the
-     * reply once the kernel has already committed. $stagedIdentity is
-     * the device and inode the staged file carried a moment earlier,
-     * which is what makes the three outcomes distinguishable — see
-     * classifyFailedRename().
-     *
-     * @param array{dev: int, ino: int} $stagedIdentity
-     */
-    private function commitStagedFile(
-        string $path,
-        string $staged,
-        string $to,
-        string $staging,
-        array $stagedIdentity,
-    ): void {
-        try {
-            $this->filesystem->move($staged, $to);
-        } catch (Throwable $renameFailure) {
-            try {
-                $committed = $this->classifyFailedRename($path, $staged, $to, $stagedIdentity);
-            } catch (Throwable $indeterminate) {
-                // rmdir(2) refuses a directory that still holds
-                // anything, so this removes the staging directory only
-                // where nothing unaccounted for is left in it.
-                $this->deleteDirectoryBestEffort($staging);
-
-                throw $indeterminate;
-            }
-
-            if (!$committed) {
-                $this->deleteBestEffort($staged);
-                $this->deleteDirectoryBestEffort($staging);
-
-                throw $renameFailure;
-            }
-        }
-
         $this->deleteDirectoryBestEffort($staging);
     }
 
     /**
-     * Decides what a failed rename actually did, from the staged file's
-     * own identity.
-     *
-     * Returns true when the staged inode is gone from the staging
-     * directory and is the one now at $to: the rename committed and the
-     * only thing left is cleanup. Returns false when that same inode is
-     * still staged: it did not commit, so the staged file is this call's
-     * to remove and the original failure is what the caller gets.
-     *
-     * Everything else is unproven and throws
-     * IndeterminatePublicationException: a status that cannot be read,
-     * an identity the filesystem does not supply, a staged path holding
-     * some other inode, or a $to holding neither the old file nor the
-     * staged one. Nothing is deleted on that path — an object whose
-     * ownership is not established is not this call's to remove — beyond
-     * the staging directory, which rmdir(2) refuses while anything is
-     * still in it.
-     *
-     * @param array{dev: int, ino: int} $stagedIdentity
+     * Amp\File\File::write() returns nothing and is not required to
+     * have stored what it accepted, so the closed file's length is read
+     * back and compared. A length the filesystem cannot report fails the
+     * publication too — unknown is never treated as correct. See
+     * {doc}`storage` for what this promises and what it does not.
      */
-    private function classifyFailedRename(string $path, string $staged, string $to, array $stagedIdentity): bool
-    {
-        try {
-            $stagedNow = $this->filesystem->getLinkStatus($staged);
-            $destinationNow = $stagedNow === null ? $this->filesystem->getLinkStatus($to) : null;
-        } catch (Throwable) {
-            throw IndeterminatePublicationException::atLocation($path, IndeterminatePublicationException::REASON_UNREADABLE);
-        }
-
-        if ($stagedNow !== null) {
-            if (self::identityOf($stagedNow) === $stagedIdentity) {
-                return false;
-            }
-
-            throw IndeterminatePublicationException::atLocation($path, IndeterminatePublicationException::REASON_FOREIGN_STAGED_OBJECT);
-        }
-
-        if ($destinationNow !== null && self::identityOf($destinationNow) === $stagedIdentity) {
-            return true;
-        }
-
-        throw IndeterminatePublicationException::atLocation($path, IndeterminatePublicationException::REASON_DESTINATION_NOT_STAGED);
-    }
-
-    /**
-     * The staged file's device and inode, once its stored length has
-     * been checked against the $written bytes handed to it.
-     *
-     * Amp\File\File::write() returns void and is not required to have
-     * stored what it accepted, so the length has to be read back;
-     * {doc}`storage` states what that promises and what it does not.
-     * The identity comes from the same status, which commitStagedFile()
-     * needs to classify a rename that fails without saying whether it
-     * happened. A length or an identity the filesystem cannot report
-     * fails the publication: unknown is never treated as correct.
-     *
-     * @return array{dev: int, ino: int}
-     * @throws FilesystemException when the length or the identity
-     *   disagrees with what was staged, or cannot be read
-     */
-    private function verifiedStagedIdentity(string $staged, int $written): array
+    private function assertStagedLength(string $staged, int $written): void
     {
         $status = $this->filesystem->getLinkStatus($staged);
-        $size = $status !== null ? ($status['size'] ?? null) : null;
+        $size = $status['size'] ?? null;
 
         if ($size !== $written) {
-            throw new FilesystemException(\sprintf(
+            throw new RuntimeException(\sprintf(
                 'the staged file holds %s, not the %d byte(s) written to it',
                 \is_int($size) ? $size . ' byte(s)' : 'an unreportable length',
                 $written,
             ));
         }
-
-        // A status that could not be read reports no length either, so
-        // the check above has already thrown for it.
-        $identity = self::identityOf($status);
-
-        if ($identity === null) {
-            throw new FilesystemException('the staged file reports no device and inode to publish it by');
-        }
-
-        return $identity;
-    }
-
-    /**
-     * A status's device and inode, or null when the filesystem supplies
-     * neither as a usable value (PHP reports an unavailable field as 0).
-     * Two statuses describe the same object when this returns the same
-     * pair for both.
-     *
-     * @param array<string, mixed> $status
-     * @return array{dev: int, ino: int}|null
-     */
-    private static function identityOf(array $status): ?array
-    {
-        $device = $status['dev'] ?? null;
-        $inode = $status['ino'] ?? null;
-
-        if (!\is_int($device) || !\is_int($inode) || $inode === 0) {
-            return null;
-        }
-
-        return ['dev' => $device, 'ino' => $inode];
-    }
-
-    /**
-     * Creates, and returns the path of, a staging directory in $to's own
-     * directory. mkdir(2) is atomic and the name is random per call, so
-     * anything already at that path — a symlink included — fails the
-     * creation rather than being followed or reused. Every component
-     * above it is the destination's own, already checked by
-     * assertNoSymlinkBelowRoot().
-     *
-     * A creation failure removes nothing: a driver running mkdir(2) in a
-     * worker can lose the reply after the directory exists, and neither
-     * that nor a directory found at this path shows whether it is this
-     * call's own. What the failure can leave is the empty directory
-     * {doc}`storage` discloses; nothing was written into it and no
-     * destination was touched.
-     */
-    private function createStagingDirectory(string $to): string
-    {
-        $staging = \dirname($to) . '/.kinetis-stage.' . \bin2hex(\random_bytes(16));
-
-        $this->filesystem->createDirectory($staging, self::STAGING_DIRECTORY_MODE);
-
-        return $staging;
     }
 
     /**
      * The mode to publish with when the caller asked for none: the one
-     * $to already carries if it exists, so a replacement never widens or
-     * narrows what it replaced, and otherwise the mode $staged's own
-     * creation produced, which is this deployment's umask default for a
-     * new file. Read from the filesystem rather than from umask(), which
-     * PHP can only report by setting it and setting it back.
-     *
-     * A mode neither path can supply falls back to STAGED_FILE_MODE:
-     * unknown permissions are published private, never guessed public.
+     * $to already carries if it exists, so a replacement neither widens
+     * nor narrows what it replaced. Null when $to does not exist or
+     * reports no mode, which leaves the staged file at the mode its own
+     * creation produced — this deployment's umask default.
      */
-    private function defaultPublicationModeFor(string $to, string $staged): int
+    private function publicationMode(string $to): ?int
     {
-        foreach ([$to, $staged] as $path) {
-            $status = $this->filesystem->getLinkStatus($path);
-            $mode = $status !== null ? ($status['mode'] ?? null) : null;
+        $mode = $this->filesystem->getLinkStatus($to)['mode'] ?? null;
 
-            if (\is_int($mode)) {
-                return $mode & 0777;
-            }
-        }
-
-        return self::STAGED_FILE_MODE;
+        return \is_int($mode) ? $mode & 0777 : null;
     }
 
     /**
-     * Runs $body, then closes $handles, without letting the closing
-     * rewrite what went wrong.
-     *
-     * A finally that throws replaces the exception its try was already
-     * propagating, chaining the original beneath it — so an unguarded
-     * close() failure on the way out of a failed pipe() becomes the
-     * failure the caller reports. Capturing the primary first and
-     * handing it to closeAll() keeps the original the reported one.
-     *
-     * With nothing already failing, a close() failure is the failure:
-     * closing is part of the operation.
-     *
-     * @template T
-     * @param list<File> $handles
-     * @param Closure(): T $body
-     * @return T whatever $body returned
+     * Closes $handle. With $failure already being reported the close
+     * failure is absorbed, since that failure is what the operation
+     * reports; with nothing failing, closing is part of the operation
+     * and its failure is the operation's.
      */
-    private static function closingAfter(array $handles, Closure $body): mixed
+    private static function closeHandle(File $handle, ?Throwable $failure): void
     {
-        $primaryFailure = null;
-
         try {
-            return $body();
+            $handle->close();
         } catch (Throwable $e) {
-            $primaryFailure = $e;
-
-            throw $e;
-        } finally {
-            self::closeAll($handles, $primaryFailure);
-        }
-    }
-
-    /**
-     * Closes every handle, attempting each whatever the ones before it
-     * did: a first close that throws must not leave a second handle
-     * open, which is what closing them one statement after another would
-     * do.
-     *
-     * With $primaryFailure in flight every close failure is absorbed,
-     * since that failure is what the operation reports. With none, the
-     * first close failure in $handles order is thrown, so the reported
-     * failure is deterministic rather than whichever handle happened to
-     * be closed last.
-     *
-     * @param list<File> $handles
-     */
-    private static function closeAll(array $handles, ?Throwable $primaryFailure): void
-    {
-        $cleanupFailure = null;
-
-        foreach ($handles as $handle) {
-            try {
-                $handle->close();
-            } catch (Throwable $e) {
-                $cleanupFailure ??= $e;
+            if ($failure === null) {
+                throw $e;
             }
         }
-
-        if ($primaryFailure === null && $cleanupFailure !== null) {
-            throw $cleanupFailure;
-        }
     }
 
     /**
-     * Creates the directories $location needs to exist under, if they do
-     * not already. Never undone by a caller that later fails: a
+     * Creates the directories $location needs to exist under, if they
+     * do not already. Never undone by a caller that later fails: a
      * directory is shared state, and a concurrent call may already be
      * publishing into one this call happened to create — which is why
-     * publishThroughStagingDirectory()'s failure guarantee excludes
-     * these and only these.
+     * publish()'s failure guarantee excludes these and only these.
      */
     private function ensureParentDirectoryExists(string $location, Config $config): void
     {
@@ -1541,17 +1062,17 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
             return;
         }
 
-        $this->filesystem->createDirectoryRecursively($directory, $this->implicitDirectoryModeFor($config));
+        $this->filesystem->createDirectoryRecursively($directory, $this->implicitDirectoryMode($config));
     }
 
     /**
      * The mode createDirectory() applies to the directory a caller
      * named: `visibility` first, `directory_visibility` second — the
-     * precedence League\Flysystem\Local\LocalFilesystemAdapter uses for
-     * the same call, since a caller naming one directory means that
-     * directory whichever of the two keys they reached for.
+     * precedence Flysystem's own local adapter uses for the same call,
+     * since a caller naming one directory means that directory
+     * whichever of the two keys they reached for.
      */
-    private function explicitDirectoryModeFor(Config $config): int
+    private function explicitDirectoryMode(Config $config): int
     {
         $visibility = $config->get(Config::OPTION_VISIBILITY, $config->get(Config::OPTION_DIRECTORY_VISIBILITY));
 
@@ -1562,14 +1083,13 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
 
     /**
      * The mode a parent directory built on the way to a file lands on:
-     * `directory_visibility` only, never `visibility`. A `visibility` on
-     * a write, copy or move names the file that call publishes, and a
-     * private file does not ask for a private directory above it — a
-     * `0700` parent created that way would also cut off every sibling
-     * already published there under a different call's options. A caller
-     * that wants the tree private says so with `directory_visibility`.
+     * `directory_visibility` only, never `visibility`. A `visibility`
+     * on a write, copy or move names the file that call publishes, and
+     * a private file does not ask for a private directory above it — a
+     * 0700 parent created that way would also cut off every sibling
+     * already published there under a different call's options.
      */
-    private function implicitDirectoryModeFor(Config $config): int
+    private function implicitDirectoryMode(Config $config): int
     {
         $visibility = $config->get(Config::OPTION_DIRECTORY_VISIBILITY);
 
@@ -1579,21 +1099,12 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     }
 
     /**
-     * Removes a staged file that will never be published, whether the
-     * publication failed or already succeeded. Best-effort by design: on
-     * the failure path the failure that prompted the cleanup is what the
-     * caller reports and a second failure here must never mask it, and
-     * on the success path the destination is already committed, so
-     * nothing here may turn a completed operation into a reported
-     * failure. That is a real trade, not a free one — a cleanup that
-     * fails leaves the staged file where it is, which is why
-     * publishThroughStagingDirectory() promises the attempt rather than
-     * the outcome.
-     *
-     * Called only once the staged file's handle is closed: unlinking a
-     * file with a still-open handle works on POSIX, but Windows commonly
-     * refuses to — so a handle that could not be closed is itself a
-     * reason this may not remove anything.
+     * Removes a staged file that will never be published. Best-effort
+     * by design: the failure that prompted the cleanup is what the
+     * caller reports and a second failure here must never mask it. That
+     * is a real trade — a cleanup that fails leaves the staged file
+     * where it is, which is why publish() promises the attempt rather
+     * than the outcome.
      */
     private function deleteBestEffort(string $location): void
     {
@@ -1601,18 +1112,15 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
             $this->filesystem->deleteFile($location);
         } catch (Throwable) {
             // Best-effort; the original failure is what's reported.
-            // Swallowing every type, not only the expected ones, is the
-            // whole point: this runs while a failure is already being
-            // reported, and must not become that failure.
         }
     }
 
     /**
-     * The staging directory's counterpart to deleteBestEffort(), for the
-     * same reasons — and rmdir(2) refuses a directory that still holds
-     * anything, so a staged file that could not be removed leaves its
-     * directory in place rather than taking a still-present file down
-     * with it silently.
+     * The staging directory's counterpart to deleteBestEffort(), for
+     * the same reason — and rmdir(2) refuses a directory that still
+     * holds anything, so a staged file that could not be removed leaves
+     * its directory in place rather than taking a still-present file
+     * down with it silently.
      */
     private function deleteDirectoryBestEffort(string $location): void
     {
@@ -1637,9 +1145,7 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     /**
      * The one preamble every operation shares: confine $path, prove no
      * component of it resolves through a symlink, and hand back the
-     * location to act on. Every caller runs this inside its own
-     * exception boundary, so a driver failure raised by the walk is
-     * reported as the operation that asked for it.
+     * location to act on.
      *
      * @throws PathTraversalDetected|CorruptedPathDetected when $path is
      *   not confined — see ConfinedPath
@@ -1654,24 +1160,19 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     }
 
     /**
-     * The preamble a single-operand publication runs instead: the same
-     * confinement and symlink walk, with a destination naming $root
-     * itself refused first.
-     *
-     * $refuse builds that refusal, since it is the one outcome this
-     * preamble cannot name on its own — write() reports it as an
-     * UnableToWriteFile, move() and copy() as their own types. The
-     * decision needs nothing but the confined path's own segments, so
-     * the refusal lands before the walk below reaches the driver.
-     *
-     * @param Closure(): Throwable $refuse
+     * The preamble a single-operand publication runs instead, returning
+     * null for a destination naming $root itself — the one outcome this
+     * preamble cannot name, since write() reports it as an
+     * UnableToWriteFile while move() and copy() report their own types.
+     * The decision needs nothing but the confined path's own segments,
+     * so it lands before the walk below reaches the driver.
      */
-    private function publicationLocation(string $path, Closure $refuse): string
+    private function publicationLocation(string $path): ?string
     {
         $confined = ConfinedPath::from($path);
 
         if ($confined->namesTheRoot()) {
-            throw $refuse();
+            return null;
         }
 
         $this->assertNoSymlinkBelowRoot($confined);
@@ -1683,21 +1184,18 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
      * The same preamble for a two-operand operation, with both operands
      * confined before either is walked. Each is judged on its own, and
      * confinement is a purely lexical rule, so an unconfined operand on
-     * either side costs no filesystem call at all — an escaping
-     * destination is refused just as early as an escaping source, and a
-     * destination naming $root itself just as early as both.
+     * either side costs no filesystem call at all. The destination is
+     * null when it names $root itself.
      *
-     * @param Closure(): Throwable $refuse builds the refusal for a
-     *   destination that names $root — see publicationLocation()
-     * @return array{string, string}
+     * @return array{string, string|null}
      */
-    private function confinedLocationPair(string $source, string $destination, Closure $refuse): array
+    private function confinedLocationPair(string $source, string $destination): array
     {
         $from = ConfinedPath::from($source);
         $to = ConfinedPath::from($destination);
 
         if ($to->namesTheRoot()) {
-            throw $refuse();
+            return [$this->locate($from), null];
         }
 
         $this->assertNoSymlinkBelowRoot($from);
@@ -1709,12 +1207,9 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     /**
      * Walks $path one confined segment at a time, from directly under
      * $root down to the target, and returns the logical path of the
-     * first segment that is a symlink — checked with
-     * Filesystem::isSymlink() (lstat semantics: it reports the component
-     * itself, never what it resolves to) — or null if none of them are.
-     * A component that does not exist yet is not a symlink either, so
-     * this never rejects a path that is merely new, only one that
-     * already passes through a link somewhere.
+     * first segment that is a symlink, or null if none of them are. A
+     * component that does not exist yet is not a symlink either, so
+     * this never rejects a path that is merely new.
      *
      * The segments come from the confined path rather than from cutting
      * the root back off a prefixed location, so what is walked is what
@@ -1739,8 +1234,8 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
 
     /**
      * @throws SymbolicLinkEncountered when any component of $path is a
-     *   symlink — see this class's own docblock for the policy and its one
-     *   disclosed limitation.
+     *   symlink — see this class's own docblock for the policy and its
+     *   one disclosed limitation.
      */
     private function assertNoSymlinkBelowRoot(ConfinedPath $path): void
     {

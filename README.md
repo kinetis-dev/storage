@@ -25,9 +25,13 @@ API-first applications, developed in the
 Read, write, delete, and list files against `League\Flysystem`'s
 `FilesystemOperator` interface — swappable to a different backend with no
 application-code changes. Local storage is Kinetis's own backend,
-`Amp\File`-backed rather than Flysystem's own local adapter, so every
-operation genuinely suspends the calling Fiber instead of blocking the
-whole worker process. Remote backends (S3, etc.) live in the separate
+`Amp\File`-backed rather than Flysystem's own local adapter, so a driver
+call suspends the calling Fiber instead of blocking the whole worker
+process. `readStream()` buffers the whole object into a `php://temp`
+resource; `writeStream()` transfers the caller's own resource in
+bounded chunks, reading it with PHP's native stream functions, whose
+reads block the thread whenever they reach a disk. Remote backends
+(S3, etc.) live in the separate
 [`kinetis/storage-s3`](https://github.com/kinetis-dev/storage-s3).
 
 ```php
@@ -44,9 +48,14 @@ Every path is confined to `FILESYSTEM_ROOT` before it becomes a
 filesystem location — a `..` segment, a control byte or a backslash is
 refused with no filesystem call made, on both operands of a `move()` or
 a `copy()`, and so is a write whose destination names the root itself.
-Each operation reports a driver failure as the
-`League\Flysystem\UnableTo*` type its own interface declares — including
-a failure from the worker pool `amphp/file` runs its calls in — while a
+`write()`, `writeStream()` and `copy()` build the new file in a private
+directory beside the destination and rename it into place once its
+stored length matches, so a reader sees the whole old file or the whole
+new one and a call that fails before that rename leaves the destination
+as it was. A failure reported by the rename itself leaves the
+publication outcome unknown, a retry hazard the documentation below
+states in full. Each operation reports a driver failure as the
+`League\Flysystem\UnableTo*` type its own interface declares, while a
 policy outcome (`PathTraversalDetected`, `CorruptedPathDetected`,
 `SymbolicLinkEncountered`, `InvalidVisibilityProvided`) and a programmer
 error both keep their own type. Symlinks are checked, with a disclosed
