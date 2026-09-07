@@ -14,15 +14,9 @@ use League\Flysystem\PathTraversalDetected;
  * components every check and every filesystem location in that class is
  * built from.
  *
- * AmpFileAdapter is a public, documented class a consumer can construct
- * and call with no League\Flysystem\Filesystem in front of it, so the
- * normalization League\Flysystem\WhitespacePathNormalizer performs for
- * FilesystemOperator callers is not the boundary — this is. Every
- * operand of every operation passes through from() before a prefix is
- * applied, both sides of move() and copy() included, each validated on
- * its own.
- *
- * The rules, and what each one refuses:
+ * Every operand of every operation passes through from() before a prefix
+ * is applied, both sides of move() and copy() included, each validated
+ * on its own. The rules, and what each one refuses:
  *
  * - A `..` segment anywhere throws
  *   League\Flysystem\PathTraversalDetected: `../etc/passwd`, and equally

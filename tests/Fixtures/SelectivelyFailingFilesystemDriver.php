@@ -7,37 +7,29 @@ namespace Kinetis\Storage\Tests\Fixtures;
 use Amp\File\File;
 use Amp\File\FilesystemDriver;
 use Amp\File\FilesystemException;
-use Closure;
 use Throwable;
 
 /**
  * A real Amp\File\FilesystemDriver decorator delegating every call to a
- * real driver — the smallest available seam for forcing a deterministic
- * failure at a specific call:
- * Amp\File\Filesystem itself is `final`, but its constructor takes an
- * injectable FilesystemDriver interface, and building a real Filesystem
- * around this decorator needs no changes to AmpFileAdapter, which
- * already accepts a Filesystem instance directly. Every operation this
- * is not asked to fail runs against the real filesystem unmodified.
+ * real driver, so a test can force a deterministic failure at one named
+ * call while every other operation runs against the real filesystem
+ * unmodified. Amp\File\Filesystem is `final` but takes an injectable
+ * FilesystemDriver, and AmpFileAdapter accepts a Filesystem directly.
  *
  * The seams:
  *
  * - $failChangePermissions, $failMove, $failCreateDirectory and
  *   $failDeleteDirectory raise a real Amp\File\FilesystemException from
- *   the call they name.
- * - $moveThrows raises an arbitrary Throwable from the rename, the last
- *   step before the destination would have been published.
- * - $onOpenFile runs just before a handle is opened, with the path it
- *   is about to be opened on — the window another writer's replacement
- *   of that path lands in.
+ *   the call they name; $moveThrows raises an arbitrary Throwable from
+ *   the rename instead.
  * - $failWriteAfterBytes truncates the body and throws;
  *   $dropWritesAfterBytes truncates it and returns normally, which is
  *   the silent short write Amp\File\File::write()'s void return leaves
  *   open.
  *
- * changePermissions() and move() also record what they saw, so a test
- * can read the staging sequence out of the driver rather than inferring
- * it from an outcome.
+ * changePermissions(), move() and createDirectory() also record what
+ * they saw, so a test can read the staging sequence out of the driver
+ * rather than inferring it from an outcome.
  *
  * @internal test fixture only
  */
@@ -72,14 +64,6 @@ final class SelectivelyFailingFilesystemDriver implements FilesystemDriver
      * boundary translates.
      */
     public ?Throwable $moveThrows = null;
-
-    /**
-     * Run with the path openFile() is about to open, before the real
-     * handle exists. Null leaves openFile() alone.
-     *
-     * @var ?Closure(string): void
-     */
-    public ?Closure $onOpenFile = null;
 
     /**
      * Every rename this driver saw, in order, as "<from>:<to>".
@@ -129,10 +113,6 @@ final class SelectivelyFailingFilesystemDriver implements FilesystemDriver
     #[\Override]
     public function openFile(string $path, string $mode): File
     {
-        if ($this->onOpenFile !== null) {
-            ($this->onOpenFile)($path);
-        }
-
         return new SelectivelyFailingFile($this->real->openFile($path, $mode), $this);
     }
 

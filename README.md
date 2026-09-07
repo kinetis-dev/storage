@@ -52,11 +52,12 @@ a `copy()`, and so is a write whose destination names the root itself.
 directory beside the destination and rename it into place once its
 stored length matches, so a reader sees the whole old file or the whole
 new one and a call that fails before that rename leaves the destination
-as it was. A failure reported by the rename itself leaves the
-publication outcome unknown, a retry hazard the documentation below
-states in full. That directory's name is reserved: no listing reports
-one at any depth, a recursive deletion still removes it, and a path
-naming one is refused. Each operation reports a driver failure as the
+as it was. A failed publication reports the operation's declared
+`League\Flysystem\UnableTo*` failure; writing and copying replace the
+destination outright, so the answer to one is to run the same call
+again. The staging directory's name is reserved: no listing reports one
+at any depth, a recursive deletion still removes it, and a path naming
+one is refused. Each operation reports a driver failure as the
 `League\Flysystem\UnableTo*` type its own interface declares, while a
 policy outcome (`PathTraversalDetected`, `CorruptedPathDetected`,
 `SymbolicLinkEncountered`, `ReservedPathDetected`,

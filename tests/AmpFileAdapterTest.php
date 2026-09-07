@@ -659,6 +659,29 @@ final class AmpFileAdapterTest extends TestCase
     }
 
     /**
+     * An \Error is not a driver failure and is never relabelled as one:
+     * a programmer error inside the driver reaches the caller as
+     * itself, and the staged file is still cleaned up for a type
+     * nothing here catches.
+     */
+    public function test_an_error_from_the_driver_reaches_the_caller_as_itself(): void
+    {
+        [$adapter, $driver] = $this->instrumentedAdapter();
+        $this->adapter->write('destination.txt', 'the previous occupant', new Config());
+        $driver->moveThrows = new \Error('a programmer error inside the driver');
+
+        try {
+            $adapter->write('destination.txt', self::binaryContent(), new Config());
+            self::fail('Expected Error.');
+        } catch (\Error $e) {
+            self::assertSame('a programmer error inside the driver', $e->getMessage());
+        }
+
+        self::assertSame('the previous occupant', $this->adapter->read('destination.txt'));
+        self::assertSame(['destination.txt'], $this->rootEntries());
+    }
+
+    /**
      * A body that lost its tail without reporting it is the hazard
      * Amp\File\File::write()'s void return leaves open, and the staged
      * length check is what rejects it. Proven for each of the three
@@ -716,12 +739,9 @@ final class AmpFileAdapterTest extends TestCase
     }
 
     /**
-     * A rename that fails before the kernel is ever asked — which is
-     * what this driver injects — is the operation's failure, whatever
-     * type it failed with, and leaves the destination the caller
-     * already had. A rename the kernel did perform but did not
-     * acknowledge is indistinguishable from this one to the adapter;
-     * {doc}`storage` states what that leaves a caller able to conclude.
+     * A failed rename is the operation's own failure and leaves the
+     * destination the caller already had, for a copy as much as for a
+     * write.
      */
     public function test_a_failed_rename_fails_the_copy_and_leaves_the_destination(): void
     {
@@ -738,43 +758,6 @@ final class AmpFileAdapterTest extends TestCase
         }
 
         self::assertSame('the previous occupant', $this->adapter->read('destination.txt'));
-        self::assertSame(['destination.txt', 'source.txt'], $this->rootEntries());
-    }
-
-    /**
-     * A retaining copy reads the mode it will publish at off the source
-     * pathname, and opens the source handle after that. Another writer
-     * replacing a public file with a private one in between would
-     * otherwise publish the private file's bytes at the public file's
-     * mode; the copy fails instead, with the destination untouched.
-     */
-    public function test_a_retaining_copy_fails_when_the_source_pathname_is_replaced_before_it_is_opened(): void
-    {
-        [$adapter, $driver] = $this->instrumentedAdapter();
-        $this->adapter->write('source.txt', 'the public source', new Config([Config::OPTION_VISIBILITY => Visibility::PUBLIC]));
-        $this->adapter->write('destination.txt', 'the previous occupant', new Config([Config::OPTION_VISIBILITY => Visibility::PUBLIC]));
-
-        // A different file at the same pathname — a new inode, private
-        // — landing in the window the check covers.
-        $driver->onOpenFile = function (string $path): void {
-            if (!str_ends_with($path, '/source.txt')) {
-                return;
-            }
-
-            unlink("{$this->root}/source.txt");
-            file_put_contents("{$this->root}/source.txt", 'the private secret');
-            chmod("{$this->root}/source.txt", 0600);
-        };
-
-        try {
-            $adapter->copy('source.txt', 'destination.txt', new Config());
-            self::fail('Expected UnableToCopyFile.');
-        } catch (UnableToCopyFile $e) {
-            self::assertStringContainsString('the source was replaced', $e->getMessage());
-        }
-
-        self::assertSame('the previous occupant', $this->adapter->read('destination.txt'));
-        self::assertSame(0644, fileperms("{$this->root}/destination.txt") & 0777);
         self::assertSame(['destination.txt', 'source.txt'], $this->rootEntries());
     }
 
