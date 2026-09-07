@@ -271,12 +271,16 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
      * The caller's resource's current blocking mode, or null when the
      * stream does not report one — a wrapper is free to omit the key,
      * and a mode that was never observed is not one to restore.
+     * php://temp is such a wrapper, so the metadata is read as the
+     * open-ended array it is.
      *
      * @param resource $contents
      */
     private static function blockingModeOf($contents): ?bool
     {
-        $blocked = \stream_get_meta_data($contents)['blocked'] ?? null;
+        /** @var array<string, mixed> $meta */
+        $meta = \stream_get_meta_data($contents);
+        $blocked = $meta['blocked'] ?? null;
 
         return \is_bool($blocked) ? $blocked : null;
     }
