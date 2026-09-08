@@ -840,9 +840,13 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
      *
      * Nothing before the rename touches $to, so a publication that
      * fails before it leaves $to as it was. Every failure reports the
-     * operation's declared Flysystem failure; writing and copying are
-     * idempotent replacements of $to, so a caller's action on one is to
-     * run the same call again.
+     * operation's declared Flysystem failure, which is one type over
+     * two outcomes: this method reports what the rename call answered,
+     * and a lost answer is not a rename that did not happen, so a
+     * failure raised by the rename leaves $to holding either file.
+     * Telling those apart would need state this method cannot observe,
+     * so it classifies nothing and the retry decision stays the
+     * caller's, on the terms that page sets out.
      *
      * $fill receives the open staged handle, writes the body into it,
      * and returns the byte count it handed over. This method is that

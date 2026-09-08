@@ -53,12 +53,16 @@ directory beside the destination and rename it into place once its
 stored length matches, so a reader sees the whole old file or the whole
 new one and a call that fails before that rename leaves the destination
 as it was. A failed publication reports the operation's declared
-`League\Flysystem\UnableTo*` failure; writing and copying replace the
-destination outright, so the answer to one is to run the same call
-again. The staging directory's name is reserved: no listing reports one
-at any depth, a recursive deletion still removes it, and a path naming
-one is refused. Each operation reports a driver failure as the
-`League\Flysystem\UnableTo*` type its own interface declares, while a
+`League\Flysystem\UnableTo*` failure, and a failure reported by the
+rename itself leaves the outcome unknown — the adapter reports what the
+call answered, and a lost answer is not a rename that did not happen.
+Retrying is safe where this caller is the only writer to that path;
+where writers compete for one, serializing ownership of it is the
+caller's to arrange, since every operation here replaces
+unconditionally. The staging directory's name is reserved: no listing
+reports one at any depth, a recursive deletion still removes it, and a
+path naming one is refused. Each operation reports a driver failure as
+the `League\Flysystem\UnableTo*` type its own interface declares, while a
 policy outcome (`PathTraversalDetected`, `CorruptedPathDetected`,
 `SymbolicLinkEncountered`, `ReservedPathDetected`,
 `InvalidVisibilityProvided`) and a programmer error both keep their own
