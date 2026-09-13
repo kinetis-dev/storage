@@ -10,7 +10,7 @@
     ],
     "require": {
         "php": "^8.4",
-        "kinetis/framework": "dev-main",
+        "kinetis/framework": "^1.8.1",
         "league/flysystem": "^3.35.2",
         "league/mime-type-detection": "^1.17.0",
         "amphp/file": "^3.2.0",
@@ -41,12 +41,6 @@
             "bootstrap": "Kinetis\\Storage\\PackageBootstrap"
         }
     },
-    "repositories": [
-        {
-            "type": "path",
-            "url": "../framework"
-        }
-    ],
     "config": {
         "sort-packages": true,
         "allow-plugins": {
