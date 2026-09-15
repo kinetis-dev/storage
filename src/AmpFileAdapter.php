@@ -51,7 +51,7 @@ use function Amp\ByteStream\pipe;
  * so readStream() buffers the whole object into a `php://temp` resource
  * and writeStream() reads the caller's resource with PHP's own stream
  * functions on the calling thread. Both block this thread wherever they
- * reach a disk. {doc}`storage` states the boundaries in full.
+ * reach a disk. {doc}`appendix-storage` states the boundaries in full.
  *
  * $root must be non-empty; an empty one would leave every location
  * relative to the worker's working directory. A root of '/' is valid,
@@ -72,7 +72,7 @@ use function Amp\ByteStream\pipe;
  * that is a symlink. Listing and recursive deletion apply the same
  * check to each entry they discover, which is also what stops a symlink
  * cycle. A link created while an operation runs is not detected;
- * {doc}`storage` states the threat model that follows.
+ * {doc}`appendix-storage` states the threat model that follows.
  *
  * Confinement, the root-destination refusal, the symlink preflight and
  * every Amp\File call an operation makes sit inside that operation's
@@ -829,7 +829,7 @@ final readonly class AmpFileAdapter implements FilesystemAdapter
     /**
      * Builds $to's new content inside a private staging directory and
      * renames it into place — the single publication path write(),
-     * writeStream() and copy() share. {doc}`storage` states the sequence
+     * writeStream() and copy() share. {doc}`appendix-storage` states the sequence
      * and the guarantees that follow from it; two things hold it
      * together here.
      *
