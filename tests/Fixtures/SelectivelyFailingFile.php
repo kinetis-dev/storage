@@ -8,6 +8,7 @@ use Amp\ByteStream\StreamException;
 use Amp\ByteStream\ReadableStreamIteratorAggregate;
 use Amp\Cancellation;
 use Amp\File\File;
+use Amp\File\LockType;
 use Amp\File\Whence;
 use Closure;
 use IteratorAggregate;
@@ -177,5 +178,29 @@ final class SelectivelyFailingFile implements File, IteratorAggregate
     public function isWritable(): bool
     {
         return $this->real->isWritable();
+    }
+
+    #[\Override]
+    public function lock(LockType $type, ?Cancellation $cancellation = null): void
+    {
+        $this->real->lock($type, $cancellation);
+    }
+
+    #[\Override]
+    public function tryLock(LockType $type): bool
+    {
+        return $this->real->tryLock($type);
+    }
+
+    #[\Override]
+    public function unlock(): void
+    {
+        $this->real->unlock();
+    }
+
+    #[\Override]
+    public function getLockType(): ?LockType
+    {
+        return $this->real->getLockType();
     }
 }
