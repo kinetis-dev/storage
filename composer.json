@@ -20,7 +20,7 @@
         "infection/infection": "^0.35.0",
         "phpstan/phpstan": "^2.2.8",
         "phpunit/phpunit": "^13.3.3",
-        "vimeo/psalm": "^6.17"
+        "vimeo/psalm": "^7.0"
     },
     "suggest": {
         "ext-uv": "An OS-native amphp/file driver. Without it (or ext-eio) every filesystem call is an IPC round trip to a pool of worker processes, one pool per filesystem instance built.",
