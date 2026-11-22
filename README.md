@@ -102,7 +102,7 @@ Full reference across every package:
 composer require kinetis/storage
 ```
 
-Requires PHP 8.4+ and [`kinetis/framework`](https://github.com/kinetis-dev/framework). Full documentation:
+Requires PHP 8.4 or 8.5 and [`kinetis/framework`](https://github.com/kinetis-dev/framework). Full documentation:
 [kinetis.dev/docs/storage.html](https://kinetis.dev/docs/storage.html).
 
 ## License
